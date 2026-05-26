@@ -422,7 +422,7 @@ def whale_tracker_loop():
                 else:
                     lecture = "Whale privilégie ce scénario"
 
-                edge_detected = edge_score >= 7
+                edge_detected = edge_score >= 6
 
                 signal_data = {
                     "title": signal["title"],
