@@ -1,0 +1,4 @@
+date_opened,title,outcome,entry_price,trade_size,shares,max_gain,max_loss,edge_score,btc_live_open,status,result,pnl
+2026-05-26 17:11:32,"Will the price of Bitcoin be between $78,000 and $80,000 on May 26?",No,0.9877,10,10.1249,0.12,10,7,76896.6,OPEN,,
+2026-05-26 17:11:32,"Will the price of Bitcoin be above $76,000 on May 26?",Yes,0.9857,10,10.1454,0.15,10,10,76896.6,OPEN,,
+2026-05-26 23:23:29,"Will the price of Bitcoin be above $68,000 on June 2?",Yes,0.988,10,10.1215,0.12,10,8,76015.0,OPEN,,

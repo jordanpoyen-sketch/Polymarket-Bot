@@ -1,0 +1,2 @@
+date,question,action,btc_price,target_price,yes_price,no_price,trade_size,shares,max_gain,max_loss,score
+2026-05-26 14:16:12,"Will Bitcoin hit $150k by December 31, 2026?",BUY_NO_PAPER,77093.44,150000,0.095,0.905,10,11.0497,1.05,10,10
