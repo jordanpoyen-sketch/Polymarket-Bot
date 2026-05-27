@@ -16,7 +16,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
 MIN_USDC_SIZE = 25
-MIN_PRICE = 0.85
+MIN_PRICE = 0.5
 PAPER_TRADE_SIZE = 1
 
 DB_PATH = "/data/paper_trades.db"
