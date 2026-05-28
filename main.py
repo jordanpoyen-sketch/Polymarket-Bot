@@ -66,6 +66,13 @@ def init_db():
         )
     """)
 
+    # Migration si la table existait déjà sans tx_hash
+    cursor.execute("PRAGMA table_info(paper_trades)")
+    columns = [col[1] for col in cursor.fetchall()]
+
+    if "tx_hash" not in columns:
+        cursor.execute("ALTER TABLE paper_trades ADD COLUMN tx_hash TEXT")
+
     conn.commit()
     conn.close()
 
@@ -76,7 +83,15 @@ def send_telegram_message(message):
 
     try:
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-        requests.get(url, params={"chat_id": CHAT_ID, "text": message}, timeout=10)
+        requests.get(
+            url,
+            params={
+                "chat_id": CHAT_ID,
+                "text": message
+            },
+            timeout=10
+        )
+
     except Exception as e:
         print("Erreur Telegram :", e)
 
@@ -86,7 +101,13 @@ def get_btc_price():
         url = "https://api.coinbase.com/v2/prices/BTC-USD/spot"
         response = requests.get(url, timeout=10)
         data = response.json()
-        return float(data["data"]["amount"])
+
+        if "data" in data and "amount" in data["data"]:
+            return float(data["data"]["amount"])
+
+        print("Erreur Coinbase :", data)
+        return 0
+
     except Exception as e:
         print("Erreur BTC :", e)
         return 0
@@ -95,8 +116,18 @@ def get_btc_price():
 def get_wallet_activity(limit=50):
     try:
         url = "https://data-api.polymarket.com/activity"
-        params = {"user": WALLET, "limit": limit, "offset": 0}
-        response = requests.get(url, params=params, timeout=20)
+
+        params = {
+            "user": WALLET,
+            "limit": limit,
+            "offset": 0
+        }
+
+        response = requests.get(
+            url,
+            params=params,
+            timeout=20
+        )
 
         if response.status_code != 200:
             print("Erreur activité :", response.text)
@@ -114,15 +145,22 @@ def get_market_data(slug):
         return None
 
     try:
-        url = "https://gamma-api.polymarket.com/markets"
-        response = requests.get(url, params={"slug": slug}, timeout=20)
+        url = f"https://gamma-api.polymarket.com/markets/slug/{slug}"
+
+        response = requests.get(
+            url,
+            timeout=20
+        )
 
         if response.status_code != 200:
-            print("Erreur market status :", response.status_code, response.text)
+            print(
+                "Erreur market slug :",
+                response.status_code,
+                response.text
+            )
             return None
 
-        data = response.json()
-        return data[0] if data else None
+        return response.json()
 
     except Exception as e:
         print("Erreur market :", e)
@@ -132,10 +170,13 @@ def get_market_data(slug):
 def get_model_signal(btc_price):
     if btc_price > 78000:
         return "bullish"
+
     elif btc_price > 76000:
         return "range_bullish"
+
     elif btc_price > 74000:
         return "neutral"
+
     else:
         return "bearish"
 
@@ -170,7 +211,11 @@ def raw_trade_exists(tx_hash):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
 
-    cursor.execute("SELECT COUNT(*) FROM raw_trades WHERE tx_hash = ?", (tx_hash,))
+    cursor.execute(
+        "SELECT COUNT(*) FROM raw_trades WHERE tx_hash = ?",
+        (tx_hash,)
+    )
+
     exists = cursor.fetchone()[0] > 0
 
     conn.close()
@@ -188,8 +233,15 @@ def save_raw_trade(activity, btc_price):
 
     cursor.execute("""
         INSERT INTO raw_trades (
-            date_detected, tx_hash, title, slug, outcome,
-            price, usdc_size, side, btc_live
+            date_detected,
+            tx_hash,
+            title,
+            slug,
+            outcome,
+            price,
+            usdc_size,
+            side,
+            btc_live
         )
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
@@ -225,9 +277,19 @@ def save_paper_trade(activity, btc_price, edge_score):
     try:
         cursor.execute("""
             INSERT INTO paper_trades (
-                date_opened, tx_hash, title, slug, outcome,
-                entry_price, trade_size, shares, edge_score,
-                btc_live_open, status, result, pnl
+                date_opened,
+                tx_hash,
+                title,
+                slug,
+                outcome,
+                entry_price,
+                trade_size,
+                shares,
+                edge_score,
+                btc_live_open,
+                status,
+                result,
+                pnl
             )
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
@@ -256,13 +318,17 @@ def save_paper_trade(activity, btc_price, edge_score):
 
 
 def extract_winning_outcome(market):
-    # Cas classiques possibles
-    for key in ["winner", "winningOutcome", "outcome", "resolvedOutcome"]:
+    for key in [
+        "winner",
+        "winningOutcome",
+        "outcome",
+        "resolvedOutcome"
+    ]:
         value = market.get(key)
+
         if value in ["Yes", "No"]:
             return value
 
-    # Certains marchés ont un champ outcomes + outcomePrices
     outcomes_raw = market.get("outcomes")
     prices_raw = market.get("outcomePrices")
 
@@ -295,7 +361,13 @@ def resolve_paper_trades():
     cursor = conn.cursor()
 
     cursor.execute("""
-        SELECT id, slug, outcome, shares, trade_size, title
+        SELECT
+            id,
+            slug,
+            outcome,
+            shares,
+            trade_size,
+            title
         FROM paper_trades
         WHERE status = 'OPEN'
     """)
@@ -338,18 +410,32 @@ def resolve_paper_trades():
 
         if winning_outcome == outcome:
             result = "WIN"
-            pnl = round(float(shares) - float(trade_size), 2)
+            pnl = round(
+                float(shares) - float(trade_size),
+                2
+            )
         else:
             result = "LOSS"
             pnl = -float(trade_size)
 
         cursor.execute("""
             UPDATE paper_trades
-            SET status = 'CLOSED', result = ?, pnl = ?
+            SET
+                status = 'CLOSED',
+                result = ?,
+                pnl = ?
             WHERE id = ?
-        """, (result, pnl, trade_id))
+        """, (
+            result,
+            pnl,
+            trade_id
+        ))
 
-        print(f"✅ Trade résolu : {result} | Winner {winning_outcome} | PnL {pnl}")
+        print(
+            f"✅ Trade résolu : {result} | "
+            f"Winner {winning_outcome} | "
+            f"PnL {pnl}"
+        )
 
     conn.commit()
     conn.close()
@@ -365,25 +451,49 @@ def get_stats():
     cursor.execute("SELECT COUNT(*) FROM paper_trades")
     total = cursor.fetchone()[0]
 
-    cursor.execute("SELECT COUNT(*) FROM paper_trades WHERE status = 'OPEN'")
+    cursor.execute(
+        "SELECT COUNT(*) FROM paper_trades WHERE status = 'OPEN'"
+    )
     open_count = cursor.fetchone()[0]
 
-    cursor.execute("SELECT COUNT(*) FROM paper_trades WHERE status = 'CLOSED'")
+    cursor.execute(
+        "SELECT COUNT(*) FROM paper_trades WHERE status = 'CLOSED'"
+    )
     closed_count = cursor.fetchone()[0]
 
-    cursor.execute("SELECT COUNT(*) FROM paper_trades WHERE result = 'WIN'")
+    cursor.execute(
+        "SELECT COUNT(*) FROM paper_trades WHERE result = 'WIN'"
+    )
     wins = cursor.fetchone()[0]
 
-    cursor.execute("SELECT COUNT(*) FROM paper_trades WHERE result = 'LOSS'")
+    cursor.execute(
+        "SELECT COUNT(*) FROM paper_trades WHERE result = 'LOSS'"
+    )
     losses = cursor.fetchone()[0]
 
-    cursor.execute("SELECT COALESCE(SUM(pnl), 0) FROM paper_trades WHERE status = 'CLOSED'")
+    cursor.execute("""
+        SELECT COALESCE(SUM(pnl), 0)
+        FROM paper_trades
+        WHERE status = 'CLOSED'
+    """)
     pnl = cursor.fetchone()[0]
 
-    winrate = (wins / closed_count * 100) if closed_count else 0
+    winrate = (
+        wins / closed_count * 100
+        if closed_count
+        else 0
+    )
 
     cursor.execute("""
-        SELECT date_opened, title, outcome, entry_price, edge_score, status, result, pnl
+        SELECT
+            date_opened,
+            title,
+            outcome,
+            entry_price,
+            edge_score,
+            status,
+            result,
+            pnl
         FROM paper_trades
         ORDER BY id DESC
         LIMIT 20
@@ -414,7 +524,9 @@ def whale_tracker_loop():
 
     while True:
         try:
-            last_scan_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            last_scan_time = datetime.now().strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
 
             print("\n" + "=" * 60)
             print("SCAN :", last_scan_time)
@@ -441,7 +553,10 @@ def whale_tracker_loop():
                 tx_hash = activity.get("transactionHash")
                 text = title.lower()
 
-                is_btc = "bitcoin" in text or "btc" in text
+                is_btc = (
+                    "bitcoin" in text
+                    or "btc" in text
+                )
 
                 if not (
                     is_btc
@@ -451,7 +566,10 @@ def whale_tracker_loop():
                 ):
                     continue
 
-                is_new = save_raw_trade(activity, btc_price)
+                is_new = save_raw_trade(
+                    activity,
+                    btc_price
+                )
 
                 if not is_new:
                     continue
@@ -469,7 +587,11 @@ def whale_tracker_loop():
                     else "Whale privilégie ce scénario"
                 )
 
-                paper_saved = save_paper_trade(activity, btc_price, edge_score)
+                paper_saved = save_paper_trade(
+                    activity,
+                    btc_price,
+                    edge_score
+                )
 
                 signal_data = {
                     "title": title,
@@ -482,7 +604,9 @@ def whale_tracker_loop():
                     "paper_trade": paper_saved
                 }
 
-                latest_edge_signals.append(signal_data)
+                latest_edge_signals.append(
+                    signal_data
+                )
 
                 message = f"""
 🧠 RAW WHALE TRADE
@@ -534,6 +658,7 @@ def dashboard():
     <head>
         <title>Whale Dashboard</title>
         <meta http-equiv="refresh" content="60">
+
         <style>
             body {{
                 background-color: #111;
@@ -541,23 +666,28 @@ def dashboard():
                 font-family: Arial;
                 padding: 20px;
             }}
+
             .card {{
                 background-color: #1c1c1c;
                 padding: 15px;
                 margin-bottom: 15px;
                 border-radius: 10px;
             }}
+
             h1 {{
                 color: orange;
             }}
+
             .win {{
                 color: #00ff99;
             }}
+
             .loss {{
                 color: #ff6666;
             }}
         </style>
     </head>
+
     <body>
         <h1>🐋 Whale Dashboard</h1>
 
@@ -614,8 +744,22 @@ def dashboard():
     html += "<h2>📄 Derniers paper trades</h2>"
 
     for trade in stats["recent"]:
-        date_opened, title, outcome, entry_price, edge_score, status, result, pnl = trade
-        result_class = "win" if result == "WIN" else "loss"
+        (
+            date_opened,
+            title,
+            outcome,
+            entry_price,
+            edge_score,
+            status,
+            result,
+            pnl
+        ) = trade
+
+        result_class = (
+            "win"
+            if result == "WIN"
+            else "loss"
+        )
 
         html += f"""
         <div class="card">
