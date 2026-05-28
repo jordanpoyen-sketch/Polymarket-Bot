@@ -1088,7 +1088,14 @@ def get_advanced_analytics():
         clean_market_type = market_type or classify_market(title)
 
         strategy = f"{quality} | {clean_market_type} | {outcome} | {bucket}"
-        combo = f"{quality} | {clean_market_type} | {outcome} | {bucket} | Reinforcement {reinforcement_bucket(reinforcement_count) | Size {size_bucket}") }"
+        combo = (
+            f"{quality} | "
+            f"{clean_market_type} | "
+            f"{outcome} | "
+            f"{bucket} | "
+            f"Reinforcement {reinforcement_bucket(reinforcement_count)} | "
+            f"Size {size_bucket}"
+)
 
         pnl = weighted_pnl_for_trade(result, usdc_size, roi)
 
