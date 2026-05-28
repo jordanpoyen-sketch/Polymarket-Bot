@@ -1636,7 +1636,7 @@ def analytics():
     html += render_curve("✅ Quality Cumulative PnL — last 50", data["quality_curve"])
     html += render_curve("❌ Excluded Cumulative PnL — last 50", data["excluded_curve"])
 
-html += render_category_table(
+    html += render_category_table(
     "🔁 Reinforcement Analytics",
     get_category_stats("reinforcement")
 )
