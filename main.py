@@ -226,6 +226,39 @@ def calculate_edge_score(outcome, price, usdc_size, btc_signal):
     return min(score, 10)
 
 
+def classify_market(title):
+    text = title.lower()
+
+    if "reach" in text:
+        return "Reach"
+
+    if "dip" in text:
+        return "Dip"
+
+    if "above" in text:
+        return "Above"
+
+    if "below" in text:
+        return "Below"
+
+    if "between" in text:
+        return "Range"
+
+    return "Other"
+
+
+def price_bucket(price):
+    price = float(price)
+
+    if price < 0.70:
+        return "0.50-0.70"
+
+    if price < 0.90:
+        return "0.70-0.90"
+
+    return "0.90+"
+
+
 def raw_trade_exists(tx_hash):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
@@ -444,6 +477,86 @@ def resolve_paper_trades():
     conn.close()
 
 
+def get_category_stats(group_field):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT title, outcome, price, usdc_size, result, roi
+        FROM raw_trades
+        WHERE status = 'CLOSED'
+    """)
+
+    rows = cursor.fetchall()
+    conn.close()
+
+    groups = {}
+
+    for title, outcome, price, usdc_size, result, roi in rows:
+        if group_field == "outcome":
+            key = outcome
+
+        elif group_field == "price":
+            key = price_bucket(price)
+
+        elif group_field == "market":
+            key = classify_market(title)
+
+        else:
+            key = "Other"
+
+        if key not in groups:
+            groups[key] = {
+                "count": 0,
+                "wins": 0,
+                "losses": 0,
+                "roi_sum": 0,
+                "weighted_pnl": 0,
+                "total_size": 0
+            }
+
+        groups[key]["count"] += 1
+
+        if result == "WIN":
+            groups[key]["wins"] += 1
+        elif result == "LOSS":
+            groups[key]["losses"] += 1
+
+        groups[key]["roi_sum"] += float(roi or 0)
+
+        if result == "WIN":
+            groups[key]["weighted_pnl"] += float(usdc_size) * float(roi or 0) / 100
+        elif result == "LOSS":
+            groups[key]["weighted_pnl"] -= float(usdc_size)
+
+        groups[key]["total_size"] += float(usdc_size or 0)
+
+    final = []
+
+    for key, data in groups.items():
+        count = data["count"]
+        wins = data["wins"]
+        total_size = data["total_size"]
+
+        winrate = (wins / count * 100) if count else 0
+        avg_roi = (data["roi_sum"] / count) if count else 0
+        weighted_roi = (data["weighted_pnl"] / total_size * 100) if total_size else 0
+
+        final.append({
+            "name": key,
+            "count": count,
+            "wins": wins,
+            "losses": data["losses"],
+            "winrate": winrate,
+            "avg_roi": avg_roi,
+            "weighted_pnl": data["weighted_pnl"],
+            "weighted_roi": weighted_roi,
+            "total_size": total_size
+        })
+
+    return sorted(final, key=lambda x: x["count"], reverse=True)
+
+
 def get_stats():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
@@ -566,7 +679,10 @@ def get_stats():
         "paper_pnl": paper_pnl,
         "paper_winrate": paper_winrate,
         "recent_raw": recent_raw,
-        "recent_paper": recent_paper
+        "recent_paper": recent_paper,
+        "by_outcome": get_category_stats("outcome"),
+        "by_price": get_category_stats("price"),
+        "by_market": get_category_stats("market")
     }
 
 
@@ -690,6 +806,45 @@ Lecture :
         time.sleep(60)
 
 
+def render_category_table(title, rows):
+    html = f"""
+    <div class="card">
+        <h2>{title}</h2>
+        <table border="1" cellpadding="6" cellspacing="0" style="width:100%; color:white; border-collapse:collapse;">
+            <tr>
+                <th>Catégorie</th>
+                <th>Trades</th>
+                <th>Wins</th>
+                <th>Losses</th>
+                <th>Winrate</th>
+                <th>Avg ROI</th>
+                <th>Weighted ROI</th>
+                <th>Weighted PnL</th>
+            </tr>
+    """
+
+    for row in rows:
+        html += f"""
+            <tr>
+                <td>{row['name']}</td>
+                <td>{row['count']}</td>
+                <td>{row['wins']}</td>
+                <td>{row['losses']}</td>
+                <td>{row['winrate']:.2f}%</td>
+                <td>{row['avg_roi']:.2f}%</td>
+                <td>{row['weighted_roi']:.2f}%</td>
+                <td>{row['weighted_pnl']:.2f}</td>
+            </tr>
+        """
+
+    html += """
+        </table>
+    </div>
+    """
+
+    return html
+
+
 @app.get("/", response_class=HTMLResponse)
 def dashboard():
     init_db()
@@ -724,6 +879,9 @@ def dashboard():
             }}
             .loss {{
                 color: #ff6666;
+            }}
+            table {{
+                font-size: 14px;
             }}
         </style>
     </head>
@@ -770,9 +928,13 @@ def dashboard():
             <p>Winrate : {stats["paper_winrate"]:.2f}%</p>
             <p>Total PnL : {stats["paper_pnl"]:.2f} USDC</p>
         </div>
-
-        <h2>🧠 Derniers signaux</h2>
     """
+
+    html += render_category_table("📊 Analyse YES vs NO", stats["by_outcome"])
+    html += render_category_table("📊 Analyse par prix", stats["by_price"])
+    html += render_category_table("📊 Analyse par type de marché", stats["by_market"])
+
+    html += "<h2>🧠 Derniers signaux</h2>"
 
     if not latest_edge_signals:
         html += """
