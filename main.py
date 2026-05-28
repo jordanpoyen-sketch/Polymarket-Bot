@@ -28,13 +28,8 @@ latest_edge_signals = []
 last_scan_time = "Aucun scan"
 
 
-# --------------------------
-# DATABASE
-# --------------------------
-
 def init_db():
     os.makedirs("/data", exist_ok=True)
-
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
 
@@ -110,10 +105,6 @@ def init_db():
     conn.close()
 
 
-# --------------------------
-# TELEGRAM
-# --------------------------
-
 def send_telegram_message(message):
     if not BOT_TOKEN or not CHAT_ID:
         return
@@ -121,14 +112,9 @@ def send_telegram_message(message):
     try:
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
         requests.get(url, params={"chat_id": CHAT_ID, "text": message}, timeout=10)
-
     except Exception as e:
         print("Erreur Telegram :", e)
 
-
-# --------------------------
-# BTC PRICE
-# --------------------------
 
 def get_btc_price():
     try:
@@ -140,26 +126,15 @@ def get_btc_price():
             return float(data["data"]["amount"])
 
         return 0
-
     except Exception as e:
         print("Erreur BTC :", e)
         return 0
 
 
-# --------------------------
-# POLYMARKET API
-# --------------------------
-
 def get_wallet_activity(limit=50):
     try:
         url = "https://data-api.polymarket.com/activity"
-
-        params = {
-            "user": WALLET,
-            "limit": limit,
-            "offset": 0
-        }
-
+        params = {"user": WALLET, "limit": limit, "offset": 0}
         response = requests.get(url, params=params, timeout=20)
 
         if response.status_code != 200:
@@ -167,7 +142,6 @@ def get_wallet_activity(limit=50):
             return []
 
         return response.json()
-
     except Exception as e:
         print("Erreur activity :", e)
         return []
@@ -185,15 +159,10 @@ def get_market_data(slug):
             return None
 
         return response.json()
-
     except Exception as e:
         print("Erreur market :", e)
         return None
 
-
-# --------------------------
-# MARKET RESOLUTION
-# --------------------------
 
 def extract_winning_outcome(market):
     for key in ["winner", "winningOutcome", "outcome", "resolvedOutcome"]:
@@ -215,29 +184,20 @@ def extract_winning_outcome(market):
 
             if max(prices_float) >= 0.99:
                 return outcomes[max_index]
-
     except Exception as e:
         print("Erreur extraction winner :", e)
 
     return None
 
 
-# --------------------------
-# CLASSIFICATION
-# --------------------------
-
 def get_model_signal(btc_price):
     if btc_price > 78000:
         return "bullish"
-
-    elif btc_price > 76000:
+    if btc_price > 76000:
         return "range_bullish"
-
-    elif btc_price > 74000:
+    if btc_price > 74000:
         return "neutral"
-
-    else:
-        return "bearish"
+    return "bearish"
 
 
 def classify_market(title):
@@ -245,16 +205,12 @@ def classify_market(title):
 
     if "reach" in text:
         return "Reach"
-
     if "dip" in text:
         return "Dip"
-
     if "above" in text:
         return "Above"
-
     if "below" in text:
         return "Below"
-
     if "between" in text:
         return "Range"
 
@@ -266,10 +222,8 @@ def is_quality_signal(title, outcome):
 
     if market_type == "Dip" and outcome == "No":
         return False
-
     if outcome == "Yes":
         return True
-
     if market_type in ["Range", "Reach", "Above"]:
         return True
 
@@ -281,7 +235,6 @@ def price_bucket(price):
 
     if price < 0.70:
         return "0.50-0.70"
-
     if price < 0.90:
         return "0.70-0.90"
 
@@ -293,28 +246,26 @@ def reinforcement_bucket(count):
 
     if count <= 1:
         return "1"
-
     if count <= 3:
         return "2-3"
-
     if count <= 10:
         return "4-10"
 
     return "10+"
+
 
 def cumulative_size_bucket(size):
     size = float(size or 0)
 
     if size < 500:
         return "<500"
-
     if size < 2000:
         return "500-2000"
-
     if size < 5000:
         return "2000-5000"
 
     return "5000+"
+
 
 def calculate_edge_score(outcome, price, usdc_size, btc_signal):
     score = 0
@@ -342,10 +293,6 @@ def calculate_edge_score(outcome, price, usdc_size, btc_signal):
     return min(score, 10)
 
 
-# --------------------------
-# ADVANCED FEATURES
-# --------------------------
-
 def parse_iso_datetime(value):
     if not value:
         return None
@@ -353,7 +300,6 @@ def parse_iso_datetime(value):
     try:
         value = value.replace("Z", "+00:00")
         return datetime.fromisoformat(value)
-
     except Exception:
         return None
 
@@ -364,12 +310,7 @@ def calculate_time_before_expiry_minutes(slug):
     if not market:
         return None
 
-    end_date = (
-        market.get("endDateIso")
-        or market.get("endDate")
-        or market.get("umaEndDate")
-    )
-
+    end_date = market.get("endDateIso") or market.get("endDate") or market.get("umaEndDate")
     end_dt = parse_iso_datetime(end_date)
 
     if not end_dt:
@@ -381,23 +322,18 @@ def calculate_time_before_expiry_minutes(slug):
         end_dt = end_dt.replace(tzinfo=timezone.utc)
 
     diff = end_dt - now
-
     return round(diff.total_seconds() / 60, 2)
 
 
 def classify_entry_timing(minutes):
     if minutes is None:
         return "Unknown"
-
     if minutes < 0:
         return "Post Expiry API"
-
     if minutes <= 30:
         return "Very Late"
-
     if minutes <= 120:
         return "Late"
-
     if minutes <= 720:
         return "Mid"
 
@@ -416,7 +352,6 @@ def calculate_reinforcement_features(title, outcome):
     """, (title, outcome))
 
     count, cumulative_size = cursor.fetchone()
-
     conn.close()
 
     return int(count) + 1, float(cumulative_size or 0)
@@ -435,18 +370,14 @@ def calculate_aggressiveness_score(title, outcome):
     """, (title, outcome))
 
     recent_count = cursor.fetchone()[0]
-
     conn.close()
 
     if recent_count >= 10:
         return 5
-
     if recent_count >= 5:
         return 4
-
     if recent_count >= 3:
         return 3
-
     if recent_count >= 1:
         return 2
 
@@ -482,23 +413,14 @@ def backfill_clean_fields():
     conn.close()
 
 
-# --------------------------
-# SAVE RAW / PAPER TRADES
-# --------------------------
-
 def raw_trade_exists(tx_hash):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
 
-    cursor.execute(
-        "SELECT COUNT(*) FROM raw_trades WHERE tx_hash = ?",
-        (tx_hash,)
-    )
-
+    cursor.execute("SELECT COUNT(*) FROM raw_trades WHERE tx_hash = ?", (tx_hash,))
     exists = cursor.fetchone()[0] > 0
 
     conn.close()
-
     return exists
 
 
@@ -517,16 +439,11 @@ def save_raw_trade(activity, btc_price):
     market_type = classify_market(title)
     quality_signal = 1 if is_quality_signal(title, outcome) else 0
 
-    reinforcement_count, previous_cumulative_size = calculate_reinforcement_features(
-        title,
-        outcome
-    )
-
+    reinforcement_count, previous_cumulative_size = calculate_reinforcement_features(title, outcome)
     cumulative_size = previous_cumulative_size + usdc_size
 
     time_before_expiry = calculate_time_before_expiry_minutes(slug)
     entry_timing = classify_entry_timing(time_before_expiry)
-
     aggressiveness_score = calculate_aggressiveness_score(title, outcome)
 
     conn = sqlite3.connect(DB_PATH)
@@ -583,7 +500,6 @@ def save_raw_trade(activity, btc_price):
 
     conn.commit()
     conn.close()
-
     return True
 
 
@@ -635,17 +551,12 @@ def save_paper_trade(activity, btc_price, edge_score):
 
         conn.commit()
         conn.close()
-
         return True
 
     except sqlite3.IntegrityError:
         conn.close()
         return False
 
-
-# --------------------------
-# RESOLVERS
-# --------------------------
 
 def resolve_raw_trades():
     conn = sqlite3.connect(DB_PATH)
@@ -737,11 +648,7 @@ def resolve_paper_trades():
                 result = ?,
                 pnl = ?
             WHERE id = ?
-        """, (
-            result,
-            pnl,
-            trade_id
-        ))
+        """, (result, pnl, trade_id))
 
         print(f"✅ PAPER résolu : {result} | PnL {pnl} | {title}")
 
@@ -749,17 +656,11 @@ def resolve_paper_trades():
     conn.close()
 
 
-# --------------------------
-# ANALYTICS
-# --------------------------
-
 def weighted_pnl_for_trade(result, usdc_size, roi):
     if result == "WIN":
         return float(usdc_size or 0) * float(roi or 0) / 100
-
     if result == "LOSS":
         return -float(usdc_size or 0)
-
     return 0
 
 
@@ -807,28 +708,20 @@ def get_category_stats(group_field):
 
         if group_field == "outcome":
             key = outcome
-
         elif group_field == "price":
             key = price_bucket(price)
-
         elif group_field == "market":
             key = market_type or classify_market(title)
-
         elif group_field == "quality":
             key = "Quality" if quality_signal == 1 else "Excluded"
-
         elif group_field == "timing":
             key = entry_timing or "Unknown"
-
         elif group_field == "aggressiveness":
             key = f"Score {aggressiveness_score}"
-
         elif group_field == "reinforcement":
             key = reinforcement_bucket(reinforcement_count)
-
         elif group_field == "cumulative_size":
             key = cumulative_size_bucket(cumulative_size)
-
         else:
             key = "Other"
 
@@ -846,7 +739,6 @@ def get_category_stats(group_field):
 
         if result == "WIN":
             groups[key]["wins"] += 1
-
         elif result == "LOSS":
             groups[key]["losses"] += 1
 
@@ -919,7 +811,6 @@ def get_stats():
     )
 
     total_weight = sum(float(usdc_size or 0) for _, usdc_size, _ in closed_rows)
-
     weighted_roi = weighted_pnl / total_weight * 100 if total_weight > 0 else 0
 
     cursor.execute("""
@@ -1000,7 +891,6 @@ def get_stats():
     """)
 
     recent_paper = cursor.fetchall()
-
     conn.close()
 
     return {
@@ -1029,7 +919,8 @@ def get_stats():
         "by_quality": get_category_stats("quality"),
         "by_timing": get_category_stats("timing"),
         "by_aggressiveness": get_category_stats("aggressiveness"),
-        "by_reinforcement": get_category_stats("reinforcement")
+        "by_reinforcement": get_category_stats("reinforcement"),
+        "by_cumulative_size": get_category_stats("cumulative_size")
     }
 
 
@@ -1088,6 +979,7 @@ def get_advanced_analytics():
         clean_market_type = market_type or classify_market(title)
 
         strategy = f"{quality} | {clean_market_type} | {outcome} | {bucket}"
+
         combo = (
             f"{quality} | "
             f"{clean_market_type} | "
@@ -1095,7 +987,7 @@ def get_advanced_analytics():
             f"{bucket} | "
             f"Reinforcement {reinforcement_bucket(reinforcement_count)} | "
             f"Size {size_bucket}"
-)
+        )
 
         pnl = weighted_pnl_for_trade(result, usdc_size, roi)
 
@@ -1167,11 +1059,7 @@ def get_advanced_analytics():
             "weighted_pnl": data["weighted_pnl"]
         })
 
-    top_strategies = sorted(
-        top_strategies,
-        key=lambda x: x["weighted_roi"],
-        reverse=True
-    )
+    top_strategies = sorted(top_strategies, key=lambda x: x["weighted_roi"], reverse=True)
 
     top_feature_combos = []
 
@@ -1195,11 +1083,7 @@ def get_advanced_analytics():
             "weighted_pnl": data["weighted_pnl"]
         })
 
-    top_feature_combos = sorted(
-        top_feature_combos,
-        key=lambda x: x["weighted_roi"],
-        reverse=True
-    )
+    top_feature_combos = sorted(top_feature_combos, key=lambda x: x["weighted_roi"], reverse=True)
 
     def rolling_winrate(n):
         sample = rows[-n:]
@@ -1208,16 +1092,10 @@ def get_advanced_analytics():
             return 0
 
         wins = sum(1 for r in sample if r[4] == "WIN")
-
         return wins / len(sample) * 100
 
     closed_count = len(rows)
-
-    positive_strategies = len([
-        s for s in top_strategies
-        if s["weighted_roi"] > 0
-    ])
-
+    positive_strategies = len([s for s in top_strategies if s["weighted_roi"] > 0])
     best_roi = top_strategies[0]["weighted_roi"] if top_strategies else 0
 
     confidence_score = min(
@@ -1242,10 +1120,6 @@ def get_advanced_analytics():
         "confidence_score": confidence_score
     }
 
-
-# --------------------------
-# MAIN LOOP
-# --------------------------
 
 def whale_tracker_loop():
     global latest_edge_signals
@@ -1301,7 +1175,6 @@ def whale_tracker_loop():
                     continue
 
                 edge_score = calculate_edge_score(outcome, price, usdc_size, btc_signal)
-
                 paper_saved = save_paper_trade(activity, btc_price, edge_score)
 
                 market_type = classify_market(title)
@@ -1371,10 +1244,6 @@ Lecture :
         time.sleep(60)
 
 
-# --------------------------
-# DASHBOARD HELPERS
-# --------------------------
-
 def render_category_table(title, rows):
     html = f"""
     <div class="card">
@@ -1432,10 +1301,6 @@ def render_curve(title, curve):
 
     return html
 
-
-# --------------------------
-# MAIN DASHBOARD
-# --------------------------
 
 @app.get("/", response_class=HTMLResponse)
 def dashboard():
@@ -1530,7 +1395,7 @@ def dashboard():
     html += render_category_table("🕒 Analyse Entry Timing", stats["by_timing"])
     html += render_category_table("🔥 Analyse Aggressiveness", stats["by_aggressiveness"])
     html += render_category_table("🔁 Analyse Reinforcement", stats["by_reinforcement"])
-html += render_category_table("💰 Cumulative Size Analytics", stats("cumulative_size"))
+    html += render_category_table("💰 Cumulative Size Analytics", stats["by_cumulative_size"])
 
     html += """
     </body>
@@ -1539,10 +1404,6 @@ html += render_category_table("💰 Cumulative Size Analytics", stats("cumulativ
 
     return html
 
-
-# --------------------------
-# ADVANCED ANALYTICS PAGE
-# --------------------------
 
 @app.get("/analytics", response_class=HTMLResponse)
 def analytics():
@@ -1563,33 +1424,27 @@ def analytics():
                 font-family: Arial;
                 padding: 20px;
             }
-
             .card {
                 background-color: #1c1c1c;
                 padding: 15px;
                 margin-bottom: 15px;
                 border-radius: 10px;
             }
-
             h1 {
                 color: orange;
             }
-
             table {
                 width: 100%;
                 color: white;
                 border-collapse: collapse;
             }
-
             th, td {
                 border: 1px solid #555;
                 padding: 6px;
             }
         </style>
     </head>
-
     <body>
-
         <h1>📊 Advanced Whale Analytics</h1>
     """
 
@@ -1607,38 +1462,17 @@ def analytics():
         </div>
     """
 
-    html += render_curve(
-        "📉 Total Cumulative PnL — last 50",
-        data["total_curve"]
-    )
+    html += render_curve("📉 Total Cumulative PnL — last 50", data["total_curve"])
+    html += render_curve("✅ Quality Cumulative PnL — last 50", data["quality_curve"])
+    html += render_curve("❌ Excluded Cumulative PnL — last 50", data["excluded_curve"])
 
-    html += render_curve(
-        "✅ Quality Cumulative PnL — last 50",
-        data["quality_curve"]
-    )
-
-    html += render_curve(
-        "❌ Excluded Cumulative PnL — last 50",
-        data["excluded_curve"]
-    )
-
-    html += render_category_table(
-        "🔁 Reinforcement Analytics",
-        get_category_stats("reinforcement")
-    )
-
-    html += render_category_table(
-        "💰 Cumulative Size Analytics",
-        get_category_stats("cumulative_size")
-    )
+    html += render_category_table("🔁 Reinforcement Analytics", get_category_stats("reinforcement"))
+    html += render_category_table("💰 Cumulative Size Analytics", get_category_stats("cumulative_size"))
 
     html += """
         <div class="card">
-
             <h2>🏆 Top Strategies min 20 trades</h2>
-
             <table>
-
                 <tr>
                     <th>Strategy</th>
                     <th>Trades</th>
@@ -1651,32 +1485,27 @@ def analytics():
     """
 
     for s in data["top_strategies"]:
-
         html += f"""
-            <tr>
-                <td>{s["name"]}</td>
-                <td>{s["count"]}</td>
-                <td>{s["wins"]}</td>
-                <td>{s["losses"]}</td>
-                <td>{s["winrate"]:.2f}%</td>
-                <td>{s["weighted_roi"]:.2f}%</td>
-                <td>{s["weighted_pnl"]:.2f}</td>
-            </tr>
+                <tr>
+                    <td>{s["name"]}</td>
+                    <td>{s["count"]}</td>
+                    <td>{s["wins"]}</td>
+                    <td>{s["losses"]}</td>
+                    <td>{s["winrate"]:.2f}%</td>
+                    <td>{s["weighted_roi"]:.2f}%</td>
+                    <td>{s["weighted_pnl"]:.2f}</td>
+                </tr>
         """
 
     html += """
             </table>
-
         </div>
     """
 
     html += """
         <div class="card">
-
             <h2>🧠 Feature Combination Analytics min 10 trades</h2>
-
             <table>
-
                 <tr>
                     <th>Combination</th>
                     <th>Trades</th>
@@ -1689,24 +1518,21 @@ def analytics():
     """
 
     for s in data["top_feature_combos"]:
-
         html += f"""
-            <tr>
-                <td>{s["name"]}</td>
-                <td>{s["count"]}</td>
-                <td>{s["wins"]}</td>
-                <td>{s["losses"]}</td>
-                <td>{s["winrate"]:.2f}%</td>
-                <td>{s["weighted_roi"]:.2f}%</td>
-                <td>{s["weighted_pnl"]:.2f}</td>
-            </tr>
+                <tr>
+                    <td>{s["name"]}</td>
+                    <td>{s["count"]}</td>
+                    <td>{s["wins"]}</td>
+                    <td>{s["losses"]}</td>
+                    <td>{s["winrate"]:.2f}%</td>
+                    <td>{s["weighted_roi"]:.2f}%</td>
+                    <td>{s["weighted_pnl"]:.2f}</td>
+                </tr>
         """
 
     html += """
             </table>
-
         </div>
-
     </body>
     </html>
     """
