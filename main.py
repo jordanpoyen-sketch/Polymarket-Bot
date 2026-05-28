@@ -7,6 +7,7 @@ import os
 import sqlite3
 import json
 from datetime import datetime, timezone
+from math import isnan
 
 
 app = FastAPI()
@@ -1829,6 +1830,172 @@ def analytics():
 
     html += """
             </table>
+        </div>
+    </body>
+    </html>
+    """
+
+    return html
+
+
+@app.get("/ml", response_class=HTMLResponse)
+def ml_dashboard():
+    init_db()
+    backfill_clean_fields()
+
+    result = run_xgboost_shadow_model()
+
+    html = """
+    <html>
+    <head>
+        <title>Whale ML</title>
+        <meta http-equiv="refresh" content="60">
+        <style>
+            body {
+                background-color: #111;
+                color: white;
+                font-family: Arial;
+                padding: 20px;
+            }
+            .card {
+                background-color: #1c1c1c;
+                padding: 15px;
+                margin-bottom: 15px;
+                border-radius: 10px;
+            }
+            h1 {
+                color: orange;
+            }
+            table {
+                width: 100%;
+                color: white;
+                border-collapse: collapse;
+            }
+            th, td {
+                border: 1px solid #555;
+                padding: 6px;
+            }
+        </style>
+    </head>
+    <body>
+        <h1>🧠 XGBoost ML Shadow Mode</h1>
+    """
+
+    if not result.get("available"):
+        html += f"""
+        <div class="card">
+            <h2>Installation nécessaire</h2>
+            <p>{result.get("message")}</p>
+            <p>Erreur : {result.get("error")}</p>
+            <p>Ajoute dans requirements.txt :</p>
+            <pre>xgboost
+scikit-learn</pre>
+        </div>
+        </body></html>
+        """
+        return html
+
+    if not result.get("enough_data"):
+        html += f"""
+        <div class="card">
+            <h2>Pas encore assez de données</h2>
+            <p>{result.get("message")}</p>
+            <p>Trades fermés disponibles : {result.get("rows")}</p>
+        </div>
+        </body></html>
+        """
+        return html
+
+    html += f"""
+        <div class="card">
+            <h2>Dataset</h2>
+            <p>Trades utilisés : {result["rows"]}</p>
+            <p>Train : {result["train_rows"]}</p>
+            <p>Test : {result["test_rows"]}</p>
+            <p>Wins : {result["wins"]}</p>
+            <p>Losses : {result["losses"]}</p>
+        </div>
+
+        <div class="card">
+            <h2>Performance ML</h2>
+            <p>Accuracy : {result["accuracy"] * 100:.2f}%</p>
+            <p>Precision WIN : {result["precision"] * 100:.2f}%</p>
+            <p>Recall WIN : {result["recall"] * 100:.2f}%</p>
+        </div>
+
+        <div class="card">
+            <h2>Top Features</h2>
+            <table>
+                <tr>
+                    <th>Feature</th>
+                    <th>Importance</th>
+                </tr>
+    """
+
+    for name, importance in result["top_features"]:
+        html += f"""
+                <tr>
+                    <td>{name}</td>
+                    <td>{importance:.4f}</td>
+                </tr>
+        """
+
+    html += """
+            </table>
+        </div>
+
+        <div class="card">
+            <h2>Open Trades — ML Predictions</h2>
+            <table>
+                <tr>
+                    <th>Market</th>
+                    <th>Outcome</th>
+                    <th>Price</th>
+                    <th>Size</th>
+                    <th>Type</th>
+                    <th>Quality</th>
+                    <th>Reinf.</th>
+                    <th>Cum Size</th>
+                    <th>Rule Score</th>
+                    <th>Rule Grade</th>
+                    <th>ML Win %</th>
+                    <th>ML Grade</th>
+                </tr>
+    """
+
+    if not result["open_predictions"]:
+        html += """
+                <tr>
+                    <td colspan="12">Aucun trade ouvert actuellement.</td>
+                </tr>
+        """
+
+    for pred in result["open_predictions"]:
+        html += f"""
+                <tr>
+                    <td>{pred["title"]}</td>
+                    <td>{pred["outcome"]}</td>
+                    <td>{float(pred["price"] or 0):.3f}</td>
+                    <td>{float(pred["usdc_size"] or 0):.2f}</td>
+                    <td>{pred["market_type"]}</td>
+                    <td>{bool(pred["quality_signal"])}</td>
+                    <td>{pred["reinforcement_count"]}</td>
+                    <td>{float(pred["cumulative_size"] or 0):.2f}</td>
+                    <td>{float(pred["probability_score"] or 0):.1f}</td>
+                    <td>{pred["trade_grade"]}</td>
+                    <td>{pred["ml_win_probability"]:.2f}%</td>
+                    <td>{pred["ml_grade"]}</td>
+                </tr>
+        """
+
+    html += """
+            </table>
+        </div>
+
+        <div class="card">
+            <h2>Mode</h2>
+            <p>Le ML est en shadow mode : il prédit, mais ne décide pas encore.</p>
+            <p>On compare ses prédictions aux grades A+ / A / B du probability model.</p>
         </div>
     </body>
     </html>
