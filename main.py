@@ -19,6 +19,7 @@ CHAT_ID = os.getenv("CHAT_ID")
 MIN_USDC_SIZE = 25
 MIN_PRICE = 0.50
 PAPER_TRADE_SIZE = 1
+MIN_STRATEGY_TRADES = 20
 
 DB_PATH = "/data/paper_trades.db"
 
@@ -264,7 +265,7 @@ def get_model_signal(btc_price):
 
 
 def classify_market(title):
-    text = title.lower()
+    text = str(title).lower()
 
     if "reach" in text:
         return "Reach"
@@ -309,6 +310,21 @@ def price_bucket(price):
         return "0.70-0.90"
 
     return "0.90+"
+
+
+def reinforcement_bucket(count):
+    count = int(count or 1)
+
+    if count <= 1:
+        return "1"
+
+    if count <= 3:
+        return "2-3"
+
+    if count <= 10:
+        return "4-10"
+
+    return "10+"
 
 
 def calculate_edge_score(outcome, price, usdc_size, btc_signal):
@@ -388,6 +404,9 @@ def classify_entry_timing(minutes):
     if minutes is None:
         return "Unknown"
 
+    if minutes < 0:
+        return "Post Expiry API"
+
     if minutes <= 30:
         return "Very Late"
 
@@ -453,6 +472,40 @@ def calculate_aggressiveness_score(title, outcome):
         return 2
 
     return 1
+
+
+def backfill_clean_fields():
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT id, title, outcome
+        FROM raw_trades
+        WHERE market_type IS NULL
+        OR market_type = ''
+        OR quality_signal IS NULL
+    """)
+
+    rows = cursor.fetchall()
+
+    for raw_id, title, outcome in rows:
+        market_type = classify_market(title)
+        quality_signal = 1 if is_quality_signal(title, outcome) else 0
+
+        cursor.execute("""
+            UPDATE raw_trades
+            SET market_type = ?,
+                quality_signal = ?
+            WHERE id = ?
+        """, (
+            market_type,
+            quality_signal,
+            raw_id
+        ))
+
+    conn.commit()
+    conn.close()
+
 
 # --------------------------
 # SAVE RAW / PAPER TRADES
@@ -728,6 +781,16 @@ def resolve_paper_trades():
 # ANALYTICS
 # --------------------------
 
+def weighted_pnl_for_trade(result, usdc_size, roi):
+    if result == "WIN":
+        return float(usdc_size or 0) * float(roi or 0) / 100
+
+    if result == "LOSS":
+        return -float(usdc_size or 0)
+
+    return 0
+
+
 def get_category_stats(group_field):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
@@ -743,7 +806,8 @@ def get_category_stats(group_field):
             market_type,
             quality_signal,
             entry_timing,
-            aggressiveness_score
+            aggressiveness_score,
+            reinforcement_count
         FROM raw_trades
         WHERE status = 'CLOSED'
     """)
@@ -763,7 +827,8 @@ def get_category_stats(group_field):
         market_type,
         quality_signal,
         entry_timing,
-        aggressiveness_score
+        aggressiveness_score,
+        reinforcement_count
     ) in rows:
 
         if group_field == "outcome":
@@ -783,6 +848,9 @@ def get_category_stats(group_field):
 
         elif group_field == "aggressiveness":
             key = f"Score {aggressiveness_score}"
+
+        elif group_field == "reinforcement":
+            key = reinforcement_bucket(reinforcement_count)
 
         else:
             key = "Other"
@@ -806,15 +874,11 @@ def get_category_stats(group_field):
             groups[key]["losses"] += 1
 
         groups[key]["roi_sum"] += float(roi or 0)
-
-        if result == "WIN":
-            groups[key]["weighted_pnl"] += (
-                float(usdc_size) * float(roi or 0) / 100
-            )
-
-        elif result == "LOSS":
-            groups[key]["weighted_pnl"] -= float(usdc_size)
-
+        groups[key]["weighted_pnl"] += weighted_pnl_for_trade(
+            result,
+            usdc_size,
+            roi
+        )
         groups[key]["total_size"] += float(usdc_size or 0)
 
     final = []
@@ -891,24 +955,25 @@ def get_stats():
     )
 
     cursor.execute("""
-        SELECT COALESCE(SUM(
-            CASE
-                WHEN result = 'WIN'
-                THEN usdc_size * roi / 100
-                ELSE usdc_size * -1
-            END
-        ), 0)
+        SELECT
+            result,
+            usdc_size,
+            roi
         FROM raw_trades
         WHERE status = 'CLOSED'
     """)
-    weighted_pnl = cursor.fetchone()[0]
 
-    cursor.execute("""
-        SELECT COALESCE(SUM(usdc_size), 0)
-        FROM raw_trades
-        WHERE status = 'CLOSED'
-    """)
-    total_weight = cursor.fetchone()[0]
+    closed_rows = cursor.fetchall()
+
+    weighted_pnl = sum(
+        weighted_pnl_for_trade(result, usdc_size, roi)
+        for result, usdc_size, roi in closed_rows
+    )
+
+    total_weight = sum(
+        float(usdc_size or 0)
+        for _, usdc_size, _ in closed_rows
+    )
 
     weighted_roi = (
         weighted_pnl / total_weight * 100
@@ -1026,7 +1091,170 @@ def get_stats():
         "by_market": get_category_stats("market"),
         "by_quality": get_category_stats("quality"),
         "by_timing": get_category_stats("timing"),
-        "by_aggressiveness": get_category_stats("aggressiveness")
+        "by_aggressiveness": get_category_stats("aggressiveness"),
+        "by_reinforcement": get_category_stats("reinforcement")
+    }
+
+
+def get_advanced_analytics():
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT
+            title,
+            outcome,
+            price,
+            usdc_size,
+            result,
+            roi,
+            market_type,
+            quality_signal
+        FROM raw_trades
+        WHERE status = 'CLOSED'
+        ORDER BY id ASC
+    """)
+
+    rows = cursor.fetchall()
+    conn.close()
+
+    total_curve = []
+    quality_curve = []
+    excluded_curve = []
+
+    total_pnl = 0
+    quality_pnl = 0
+    excluded_pnl = 0
+
+    strategies = {}
+
+    for i, row in enumerate(rows, start=1):
+        title, outcome, price, usdc_size, result, roi, market_type, quality_signal = row
+
+        bucket = price_bucket(price)
+        quality = "Quality" if quality_signal == 1 else "Excluded"
+        clean_market_type = market_type or classify_market(title)
+
+        strategy = f"{quality} | {clean_market_type} | {outcome} | {bucket}"
+
+        pnl = weighted_pnl_for_trade(
+            result,
+            usdc_size,
+            roi
+        )
+
+        total_pnl += pnl
+        total_curve.append((i, round(total_pnl, 2)))
+
+        if quality_signal == 1:
+            quality_pnl += pnl
+            quality_curve.append((i, round(quality_pnl, 2)))
+        else:
+            excluded_pnl += pnl
+            excluded_curve.append((i, round(excluded_pnl, 2)))
+
+        if strategy not in strategies:
+            strategies[strategy] = {
+                "count": 0,
+                "wins": 0,
+                "losses": 0,
+                "weighted_pnl": 0,
+                "total_size": 0
+            }
+
+        strategies[strategy]["count"] += 1
+        strategies[strategy]["total_size"] += float(usdc_size or 0)
+        strategies[strategy]["weighted_pnl"] += pnl
+
+        if result == "WIN":
+            strategies[strategy]["wins"] += 1
+
+        elif result == "LOSS":
+            strategies[strategy]["losses"] += 1
+
+    top_strategies = []
+
+    for name, data in strategies.items():
+        count = data["count"]
+
+        if count < MIN_STRATEGY_TRADES:
+            continue
+
+        total_size = data["total_size"]
+
+        winrate = (
+            data["wins"] / count * 100
+            if count
+            else 0
+        )
+
+        weighted_roi = (
+            data["weighted_pnl"] / total_size * 100
+            if total_size
+            else 0
+        )
+
+        top_strategies.append({
+            "name": name,
+            "count": count,
+            "wins": data["wins"],
+            "losses": data["losses"],
+            "winrate": winrate,
+            "weighted_roi": weighted_roi,
+            "weighted_pnl": data["weighted_pnl"]
+        })
+
+    top_strategies = sorted(
+        top_strategies,
+        key=lambda x: x["weighted_roi"],
+        reverse=True
+    )
+
+    def rolling_winrate(n):
+        sample = rows[-n:]
+
+        if not sample:
+            return 0
+
+        wins = sum(
+            1 for r in sample
+            if r[4] == "WIN"
+        )
+
+        return wins / len(sample) * 100
+
+    closed_count = len(rows)
+
+    positive_strategies = len([
+        s for s in top_strategies
+        if s["weighted_roi"] > 0
+    ])
+
+    best_roi = (
+        top_strategies[0]["weighted_roi"]
+        if top_strategies
+        else 0
+    )
+
+    confidence_score = min(
+        100,
+        max(
+            0,
+            (closed_count / 20)
+            + best_roi
+            + positive_strategies * 2
+        )
+    )
+
+    return {
+        "top_strategies": top_strategies[:15],
+        "total_curve": total_curve[-50:],
+        "quality_curve": quality_curve[-50:],
+        "excluded_curve": excluded_curve[-50:],
+        "rolling_20": rolling_winrate(20),
+        "rolling_50": rolling_winrate(50),
+        "rolling_100": rolling_winrate(100),
+        "confidence_score": confidence_score
     }
 
 
@@ -1039,6 +1267,7 @@ def whale_tracker_loop():
     global last_scan_time
 
     init_db()
+    backfill_clean_fields()
 
     while True:
         try:
@@ -1048,6 +1277,7 @@ def whale_tracker_loop():
             print("SCAN :", last_scan_time)
             print("=" * 60)
 
+            backfill_clean_fields()
             resolve_raw_trades()
             resolve_paper_trades()
 
@@ -1174,7 +1404,7 @@ Lecture :
 
 
 # --------------------------
-# DASHBOARD
+# DASHBOARD HELPERS
 # --------------------------
 
 def render_category_table(title, rows):
@@ -1215,212 +1445,34 @@ def render_category_table(title, rows):
 
     return html
 
-def get_advanced_analytics():
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
 
-    cursor.execute("""
-        SELECT title, outcome, price, usdc_size, result, roi, market_type, quality_signal
-        FROM raw_trades
-        WHERE status = 'CLOSED'
-        ORDER BY id ASC
-    """)
-
-    rows = cursor.fetchall()
-    conn.close()
-
-    cumulative_pnl = 0
-    curve = []
-    strategies = {}
-
-    for i, row in enumerate(rows, start=1):
-        title, outcome, price, usdc_size, result, roi, market_type, quality_signal = row
-
-        bucket = price_bucket(price)
-        quality = "Quality" if quality_signal == 1 else "Excluded"
-        strategy = f"{quality} | {market_type} | {outcome} | {bucket}"
-
-        pnl = float(usdc_size) * float(roi or 0) / 100 if result == "WIN" else -float(usdc_size)
-        cumulative_pnl += pnl
-
-        curve.append((i, round(cumulative_pnl, 2)))
-
-        if strategy not in strategies:
-            strategies[strategy] = {
-                "count": 0,
-                "wins": 0,
-                "losses": 0,
-                "weighted_pnl": 0,
-                "total_size": 0
-            }
-
-        strategies[strategy]["count"] += 1
-        strategies[strategy]["total_size"] += float(usdc_size)
-        strategies[strategy]["weighted_pnl"] += pnl
-
-        if result == "WIN":
-            strategies[strategy]["wins"] += 1
-        elif result == "LOSS":
-            strategies[strategy]["losses"] += 1
-
-    top_strategies = []
-
-    for name, data in strategies.items():
-        count = data["count"]
-        total_size = data["total_size"]
-        winrate = data["wins"] / count * 100 if count else 0
-        weighted_roi = data["weighted_pnl"] / total_size * 100 if total_size else 0
-
-        top_strategies.append({
-            "name": name,
-            "count": count,
-            "wins": data["wins"],
-            "losses": data["losses"],
-            "winrate": winrate,
-            "weighted_roi": weighted_roi,
-            "weighted_pnl": data["weighted_pnl"]
-        })
-
-    top_strategies = sorted(
-        top_strategies,
-        key=lambda x: x["weighted_roi"],
-        reverse=True
-    )
-
-    def rolling_winrate(n):
-        sample = rows[-n:]
-        if not sample:
-            return 0
-
-        wins = sum(1 for r in sample if r[4] == "WIN")
-        return wins / len(sample) * 100
-
-    closed_count = len(rows)
-    positive_strategies = len([s for s in top_strategies if s["weighted_roi"] > 0])
-    best_roi = top_strategies[0]["weighted_roi"] if top_strategies else 0
-
-    confidence_score = min(
-        100,
-        max(
-            0,
-            (closed_count / 10)
-            + best_roi
-            + positive_strategies * 3
-        )
-    )
-
-    return {
-        "top_strategies": top_strategies[:15],
-        "curve": curve[-50:],
-        "rolling_20": rolling_winrate(20),
-        "rolling_50": rolling_winrate(50),
-        "rolling_100": rolling_winrate(100),
-        "confidence_score": confidence_score
-    }
-
-
-@app.get("/analytics", response_class=HTMLResponse)
-def analytics():
-    data = get_advanced_analytics()
-
-    html = """
-    <html>
-    <head>
-        <title>Whale Analytics</title>
-        <meta http-equiv="refresh" content="60">
-        <style>
-            body {
-                background-color: #111;
-                color: white;
-                font-family: Arial;
-                padding: 20px;
-            }
-            .card {
-                background-color: #1c1c1c;
-                padding: 15px;
-                margin-bottom: 15px;
-                border-radius: 10px;
-            }
-            h1 {
-                color: orange;
-            }
-            table {
-                width: 100%;
-                color: white;
-                border-collapse: collapse;
-            }
-            th, td {
-                border: 1px solid #555;
-                padding: 6px;
-            }
-        </style>
-    </head>
-    <body>
-        <h1>📊 Advanced Whale Analytics</h1>
+def render_curve(title, curve):
+    html = f"""
+    <div class="card">
+        <h2>{title}</h2>
     """
 
-    html += f"""
-        <div class="card">
-            <h2>🧠 Confidence Score</h2>
-            <h1>{data["confidence_score"]:.1f}/100</h1>
-        </div>
-
-        <div class="card">
-            <h2>📈 Rolling Winrate</h2>
-            <p>Last 20 trades : {data["rolling_20"]:.2f}%</p>
-            <p>Last 50 trades : {data["rolling_50"]:.2f}%</p>
-            <p>Last 100 trades : {data["rolling_100"]:.2f}%</p>
-        </div>
-
-        <div class="card">
-            <h2>📉 Cumulative PnL Curve — last 50 points</h2>
-    """
-
-    for point, pnl in data["curve"]:
-        html += f"<p>Trade {point} : {pnl}</p>"
+    if not curve:
+        html += "<p>Aucune donnée</p>"
+    else:
+        for point, pnl in curve:
+            html += f"<p>Trade {point} : {pnl}</p>"
 
     html += """
-        </div>
-
-        <div class="card">
-            <h2>🏆 Top Strategies</h2>
-            <table>
-                <tr>
-                    <th>Strategy</th>
-                    <th>Trades</th>
-                    <th>Wins</th>
-                    <th>Losses</th>
-                    <th>Winrate</th>
-                    <th>Weighted ROI</th>
-                    <th>Weighted PnL</th>
-                </tr>
-    """
-
-    for s in data["top_strategies"]:
-        html += f"""
-                <tr>
-                    <td>{s["name"]}</td>
-                    <td>{s["count"]}</td>
-                    <td>{s["wins"]}</td>
-                    <td>{s["losses"]}</td>
-                    <td>{s["winrate"]:.2f}%</td>
-                    <td>{s["weighted_roi"]:.2f}%</td>
-                    <td>{s["weighted_pnl"]:.2f}</td>
-                </tr>
-        """
-
-    html += """
-            </table>
-        </div>
-    </body>
-    </html>
+    </div>
     """
 
     return html
 
+
+# --------------------------
+# MAIN DASHBOARD
+# --------------------------
+
 @app.get("/", response_class=HTMLResponse)
 def dashboard():
     init_db()
+    backfill_clean_fields()
 
     btc_price = get_btc_price()
     btc_signal = get_model_signal(btc_price)
@@ -1509,102 +1561,7 @@ def dashboard():
     html += render_category_table("📊 Analyse par type de marché", stats["by_market"])
     html += render_category_table("🕒 Analyse Entry Timing", stats["by_timing"])
     html += render_category_table("🔥 Analyse Aggressiveness", stats["by_aggressiveness"])
-
-    html += "<h2>🧠 Derniers signaux</h2>"
-
-    if not latest_edge_signals:
-        html += """
-        <div class="card">
-            <h3>Aucun signal récent</h3>
-        </div>
-        """
-
-    for signal in latest_edge_signals:
-        html += f"""
-        <div class="card">
-            <h3>{signal['title']}</h3>
-            <p>Outcome : {signal['outcome']}</p>
-            <p>Market type : {signal['market_type']}</p>
-            <p>Quality Signal : {signal['quality']}</p>
-            <p>Montant : {signal['total_usdc']:.2f} USDC</p>
-            <p>Prix : {signal['avg_price']:.3f}</p>
-            <p>EDGE SCORE : {signal['edge_score']}/10</p>
-            <p>Paper Trade : {signal['paper_trade']}</p>
-            <p>{signal['lecture']}</p>
-        </div>
-        """
-
-    html += "<h2>📊 Derniers raw trades</h2>"
-
-    for trade in stats["recent_raw"]:
-        (
-            date_detected,
-            title,
-            outcome,
-            price,
-            usdc_size,
-            status,
-            result,
-            roi,
-            market_type,
-            quality_signal,
-            reinforcement_count,
-            cumulative_size,
-            time_before_expiry,
-            aggressiveness_score,
-            entry_timing
-        ) = trade
-
-        result_class = "win" if result == "WIN" else "loss"
-
-        html += f"""
-        <div class="card">
-            <h3>{title}</h3>
-            <p>Date : {date_detected}</p>
-            <p>Outcome : {outcome}</p>
-            <p>Market type : {market_type}</p>
-            <p>Quality Signal : {bool(quality_signal)}</p>
-            <p>Prix : {price}</p>
-            <p>Montant whale : {usdc_size:.2f} USDC</p>
-            <p>Reinforcement count : {reinforcement_count}</p>
-            <p>Cumulative size : {cumulative_size:.2f} USDC</p>
-            <p>Time before expiry : {time_before_expiry} min</p>
-            <p>Entry timing : {entry_timing}</p>
-            <p>Aggressiveness score : {aggressiveness_score}/5</p>
-            <p>Status : {status}</p>
-            <p>Result : <span class="{result_class}">{result}</span></p>
-            <p>ROI : {roi}</p>
-        </div>
-        """
-
-    html += "<h2>📄 Derniers paper trades</h2>"
-
-    for trade in stats["recent_paper"]:
-        (
-            date_opened,
-            title,
-            outcome,
-            entry_price,
-            edge_score,
-            status,
-            result,
-            pnl
-        ) = trade
-
-        result_class = "win" if result == "WIN" else "loss"
-
-        html += f"""
-        <div class="card">
-            <h3>{title}</h3>
-            <p>Date : {date_opened}</p>
-            <p>Outcome : {outcome}</p>
-            <p>Entry : {entry_price}</p>
-            <p>Edge score : {edge_score}/10</p>
-            <p>Status : {status}</p>
-            <p>Result : <span class="{result_class}">{result}</span></p>
-            <p>PnL : {pnl}</p>
-        </div>
-        """
+    html += render_category_table("🔁 Analyse Reinforcement", stats["by_reinforcement"])
 
     html += """
     </body>
@@ -1614,7 +1571,111 @@ def dashboard():
     return html
 
 
+# --------------------------
+# ADVANCED ANALYTICS PAGE
+# --------------------------
+
+@app.get("/analytics", response_class=HTMLResponse)
+def analytics():
+    init_db()
+    backfill_clean_fields()
+
+    data = get_advanced_analytics()
+
+    html = """
+    <html>
+    <head>
+        <title>Whale Analytics</title>
+        <meta http-equiv="refresh" content="60">
+        <style>
+            body {
+                background-color: #111;
+                color: white;
+                font-family: Arial;
+                padding: 20px;
+            }
+            .card {
+                background-color: #1c1c1c;
+                padding: 15px;
+                margin-bottom: 15px;
+                border-radius: 10px;
+            }
+            h1 {
+                color: orange;
+            }
+            table {
+                width: 100%;
+                color: white;
+                border-collapse: collapse;
+            }
+            th, td {
+                border: 1px solid #555;
+                padding: 6px;
+            }
+        </style>
+    </head>
+    <body>
+        <h1>📊 Advanced Whale Analytics</h1>
+    """
+
+    html += f"""
+        <div class="card">
+            <h2>🧠 Confidence Score</h2>
+            <h1>{data["confidence_score"]:.1f}/100</h1>
+        </div>
+
+        <div class="card">
+            <h2>📈 Rolling Winrate</h2>
+            <p>Last 20 trades : {data["rolling_20"]:.2f}%</p>
+            <p>Last 50 trades : {data["rolling_50"]:.2f}%</p>
+            <p>Last 100 trades : {data["rolling_100"]:.2f}%</p>
+        </div>
+    """
+
+    html += render_curve("📉 Total Cumulative PnL — last 50", data["total_curve"])
+    html += render_curve("✅ Quality Cumulative PnL — last 50", data["quality_curve"])
+    html += render_curve("❌ Excluded Cumulative PnL — last 50", data["excluded_curve"])
+
+    html += """
+        <div class="card">
+            <h2>🏆 Top Strategies min 20 trades</h2>
+            <table>
+                <tr>
+                    <th>Strategy</th>
+                    <th>Trades</th>
+                    <th>Wins</th>
+                    <th>Losses</th>
+                    <th>Winrate</th>
+                    <th>Weighted ROI</th>
+                    <th>Weighted PnL</th>
+                </tr>
+    """
+
+    for s in data["top_strategies"]:
+        html += f"""
+                <tr>
+                    <td>{s["name"]}</td>
+                    <td>{s["count"]}</td>
+                    <td>{s["wins"]}</td>
+                    <td>{s["losses"]}</td>
+                    <td>{s["winrate"]:.2f}%</td>
+                    <td>{s["weighted_roi"]:.2f}%</td>
+                    <td>{s["weighted_pnl"]:.2f}</td>
+                </tr>
+        """
+
+    html += """
+            </table>
+        </div>
+    </body>
+    </html>
+    """
+
+    return html
+
+
 init_db()
+backfill_clean_fields()
 
 tracker_thread = threading.Thread(
     target=whale_tracker_loop,
