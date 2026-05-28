@@ -82,7 +82,10 @@ def init_db():
         "cumulative_size": "ALTER TABLE raw_trades ADD COLUMN cumulative_size REAL DEFAULT 0",
         "time_before_expiry_minutes": "ALTER TABLE raw_trades ADD COLUMN time_before_expiry_minutes REAL",
         "aggressiveness_score": "ALTER TABLE raw_trades ADD COLUMN aggressiveness_score INTEGER DEFAULT 1",
-        "entry_timing": "ALTER TABLE raw_trades ADD COLUMN entry_timing TEXT"
+        "entry_timing": "ALTER TABLE raw_trades ADD COLUMN entry_timing TEXT",
+        "probability_score": "ALTER TABLE raw_trades ADD COLUMN probability_score REAL",
+        "trade_grade": "ALTER TABLE raw_trades ADD COLUMN trade_grade TEXT",
+        "expected_edge": "ALTER TABLE raw_trades ADD COLUMN expected_edge TEXT"
     }
 
     for column, sql in migrations.items():
@@ -293,6 +296,85 @@ def calculate_edge_score(outcome, price, usdc_size, btc_signal):
     return min(score, 10)
 
 
+
+def calculate_probability_score(title, outcome, price, reinforcement_count, cumulative_size, quality_signal):
+    market_type = classify_market(title)
+    price = float(price or 0)
+    reinforcement_count = int(reinforcement_count or 1)
+    cumulative_size = float(cumulative_size or 0)
+
+    score = 50
+    reasons = []
+
+    if quality_signal == 1:
+        score += 25
+        reasons.append("Quality signal validé")
+    else:
+        score -= 25
+        reasons.append("Signal exclu par le filtre qualité")
+
+    if market_type == "Dip" and outcome == "Yes" and 0.50 <= price < 0.70:
+        score += 25
+        reasons.append("Setup premium : Dip + Yes + prix 0.50-0.70")
+
+    elif market_type == "Range" and outcome == "Yes" and 0.50 <= price < 0.70:
+        score += 20
+        reasons.append("Setup fort : Range + Yes + prix 0.50-0.70")
+
+    elif market_type in ["Reach", "Above"] and outcome in ["Yes", "No"] and price >= 0.90:
+        score += 10
+        reasons.append("Setup historique positif : Reach/Above à forte probabilité")
+
+    if market_type == "Dip" and outcome == "No":
+        score -= 40
+        reasons.append("Anti-signal fort : Dip + No")
+
+    if outcome == "No" and 0.50 <= price < 0.90:
+        score -= 30
+        reasons.append("NO mid-price historiquement dangereux")
+
+    if cumulative_size >= 5000:
+        score += 15
+        reasons.append("Très forte taille cumulée whale")
+    elif cumulative_size >= 2000:
+        score += 10
+        reasons.append("Taille cumulée whale importante")
+    elif cumulative_size >= 500:
+        score += 5
+        reasons.append("Taille cumulée modérée")
+
+    if reinforcement_count >= 10:
+        score += 15
+        reasons.append("Renforcement très élevé")
+    elif reinforcement_count >= 4:
+        score += 10
+        reasons.append("Renforcement élevé")
+    elif reinforcement_count >= 2:
+        score += 5
+        reasons.append("Renforcement confirmé")
+
+    score = max(0, min(100, score))
+
+    if score >= 85:
+        grade = "A+"
+        expected_edge = "Very Strong"
+    elif score >= 75:
+        grade = "A"
+        expected_edge = "Strong"
+    elif score >= 65:
+        grade = "B"
+        expected_edge = "Positive"
+    elif score >= 50:
+        grade = "C"
+        expected_edge = "Neutral"
+    else:
+        grade = "D"
+        expected_edge = "Avoid"
+
+    return score, grade, expected_edge, reasons
+
+
+
 def parse_iso_datetime(value):
     if not value:
         return None
@@ -389,25 +471,47 @@ def backfill_clean_fields():
     cursor = conn.cursor()
 
     cursor.execute("""
-        SELECT id, title, outcome
+        SELECT id, title, outcome, price, reinforcement_count, cumulative_size
         FROM raw_trades
         WHERE market_type IS NULL
         OR market_type = ''
         OR quality_signal IS NULL
+        OR probability_score IS NULL
+        OR trade_grade IS NULL
+        OR trade_grade = ''
     """)
 
     rows = cursor.fetchall()
 
-    for raw_id, title, outcome in rows:
+    for raw_id, title, outcome, price, reinforcement_count, cumulative_size in rows:
         market_type = classify_market(title)
         quality_signal = 1 if is_quality_signal(title, outcome) else 0
+
+        probability_score, trade_grade, expected_edge, _ = calculate_probability_score(
+            title,
+            outcome,
+            price,
+            reinforcement_count,
+            cumulative_size,
+            quality_signal
+        )
 
         cursor.execute("""
             UPDATE raw_trades
             SET market_type = ?,
-                quality_signal = ?
+                quality_signal = ?,
+                probability_score = ?,
+                trade_grade = ?,
+                expected_edge = ?
             WHERE id = ?
-        """, (market_type, quality_signal, raw_id))
+        """, (
+            market_type,
+            quality_signal,
+            probability_score,
+            trade_grade,
+            expected_edge,
+            raw_id
+        ))
 
     conn.commit()
     conn.close()
@@ -446,6 +550,15 @@ def save_raw_trade(activity, btc_price):
     entry_timing = classify_entry_timing(time_before_expiry)
     aggressiveness_score = calculate_aggressiveness_score(title, outcome)
 
+    probability_score, trade_grade, expected_edge, probability_reasons = calculate_probability_score(
+        title,
+        outcome,
+        price,
+        reinforcement_count,
+        cumulative_size,
+        quality_signal
+    )
+
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
 
@@ -471,9 +584,12 @@ def save_raw_trade(activity, btc_price):
             cumulative_size,
             time_before_expiry_minutes,
             aggressiveness_score,
-            entry_timing
+            entry_timing,
+            probability_score,
+            trade_grade,
+            expected_edge
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         tx_hash,
@@ -495,7 +611,10 @@ def save_raw_trade(activity, btc_price):
         cumulative_size,
         time_before_expiry,
         aggressiveness_score,
-        entry_timing
+        entry_timing,
+        probability_score,
+        trade_grade,
+        expected_edge
     ))
 
     conn.commit()
@@ -772,6 +891,77 @@ def get_category_stats(group_field):
     return sorted(final, key=lambda x: x["count"], reverse=True)
 
 
+
+def get_probability_grade_stats():
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT trade_grade, usdc_size, result, roi
+        FROM raw_trades
+        WHERE status = 'CLOSED'
+        AND trade_grade IS NOT NULL
+        AND trade_grade != ''
+    """)
+
+    rows = cursor.fetchall()
+    conn.close()
+
+    groups = {}
+
+    for grade, usdc_size, result, roi in rows:
+        key = grade or "Unknown"
+
+        if key not in groups:
+            groups[key] = {
+                "count": 0,
+                "wins": 0,
+                "losses": 0,
+                "roi_sum": 0,
+                "weighted_pnl": 0,
+                "total_size": 0
+            }
+
+        groups[key]["count"] += 1
+
+        if result == "WIN":
+            groups[key]["wins"] += 1
+        elif result == "LOSS":
+            groups[key]["losses"] += 1
+
+        groups[key]["roi_sum"] += float(roi or 0)
+        groups[key]["weighted_pnl"] += weighted_pnl_for_trade(result, usdc_size, roi)
+        groups[key]["total_size"] += float(usdc_size or 0)
+
+    final = []
+
+    grade_order = {"A+": 0, "A": 1, "B": 2, "C": 3, "D": 4, "Unknown": 5}
+
+    for key, data in groups.items():
+        count = data["count"]
+        wins = data["wins"]
+        total_size = data["total_size"]
+
+        winrate = wins / count * 100 if count else 0
+        avg_roi = data["roi_sum"] / count if count else 0
+        weighted_roi = data["weighted_pnl"] / total_size * 100 if total_size else 0
+
+        final.append({
+            "name": key,
+            "count": count,
+            "wins": wins,
+            "losses": data["losses"],
+            "winrate": winrate,
+            "avg_roi": avg_roi,
+            "weighted_pnl": data["weighted_pnl"],
+            "weighted_roi": weighted_roi,
+            "total_size": total_size
+        })
+
+    return sorted(final, key=lambda x: grade_order.get(x["name"], 99))
+
+
+
 def get_stats():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
@@ -867,7 +1057,10 @@ def get_stats():
             cumulative_size,
             time_before_expiry_minutes,
             aggressiveness_score,
-            entry_timing
+            entry_timing,
+            probability_score,
+            trade_grade,
+            expected_edge
         FROM raw_trades
         ORDER BY id DESC
         LIMIT 20
@@ -920,7 +1113,8 @@ def get_stats():
         "by_timing": get_category_stats("timing"),
         "by_aggressiveness": get_category_stats("aggressiveness"),
         "by_reinforcement": get_category_stats("reinforcement"),
-        "by_cumulative_size": get_category_stats("cumulative_size")
+        "by_cumulative_size": get_category_stats("cumulative_size"),
+        "by_probability_grade": get_probability_grade_stats()
     }
 
 
@@ -1180,6 +1374,17 @@ def whale_tracker_loop():
                 market_type = classify_market(title)
                 quality = is_quality_signal(title, outcome)
 
+                reinforcement_count, previous_cumulative_size = calculate_reinforcement_features(title, outcome)
+                cumulative_size = previous_cumulative_size + usdc_size
+                probability_score, trade_grade, expected_edge, probability_reasons = calculate_probability_score(
+                    title,
+                    outcome,
+                    price,
+                    reinforcement_count,
+                    cumulative_size,
+                    1 if quality else 0
+                )
+
                 lecture = (
                     "Whale évite fortement ce scénario"
                     if outcome == "No"
@@ -1196,7 +1401,10 @@ def whale_tracker_loop():
                     "lecture": lecture,
                     "paper_trade": paper_saved,
                     "market_type": market_type,
-                    "quality": quality
+                    "quality": quality,
+                    "probability_score": probability_score,
+                    "trade_grade": trade_grade,
+                    "expected_edge": expected_edge
                 }
 
                 latest_edge_signals.append(signal_data)
@@ -1217,6 +1425,15 @@ Market type :
 
 Quality signal :
 {quality}
+
+AI Probability Score :
+{probability_score}/100
+
+Trade Grade :
+{trade_grade}
+
+Expected Edge :
+{expected_edge}
 
 Montant :
 {usdc_size:.2f} USDC
@@ -1396,6 +1613,7 @@ def dashboard():
     html += render_category_table("🔥 Analyse Aggressiveness", stats["by_aggressiveness"])
     html += render_category_table("🔁 Analyse Reinforcement", stats["by_reinforcement"])
     html += render_category_table("💰 Cumulative Size Analytics", stats["by_cumulative_size"])
+    html += render_category_table("🧠 Probability Grade Analytics", stats["by_probability_grade"])
 
     html += """
     </body>
@@ -1468,6 +1686,7 @@ def analytics():
 
     html += render_category_table("🔁 Reinforcement Analytics", get_category_stats("reinforcement"))
     html += render_category_table("💰 Cumulative Size Analytics", get_category_stats("cumulative_size"))
+    html += render_category_table("🧠 Probability Grade Analytics", get_probability_grade_stats())
 
     html += """
         <div class="card">
