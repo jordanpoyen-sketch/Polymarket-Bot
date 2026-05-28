@@ -5,6 +5,7 @@ import threading
 import time
 import os
 import sqlite3
+import json
 from datetime import datetime
 
 
@@ -16,7 +17,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
 MIN_USDC_SIZE = 25
-MIN_PRICE = 0.5
+MIN_PRICE = 0.50
 PAPER_TRADE_SIZE = 1
 
 DB_PATH = "/data/paper_trades.db"
@@ -115,8 +116,14 @@ def get_market_data(slug):
     try:
         url = "https://gamma-api.polymarket.com/markets"
         response = requests.get(url, params={"slug": slug}, timeout=20)
+
+        if response.status_code != 200:
+            print("Erreur market status :", response.status_code, response.text)
+            return None
+
         data = response.json()
         return data[0] if data else None
+
     except Exception as e:
         print("Erreur market :", e)
         return None
@@ -248,29 +255,86 @@ def save_paper_trade(activity, btc_price, edge_score):
         return False
 
 
+def extract_winning_outcome(market):
+    # Cas classiques possibles
+    for key in ["winner", "winningOutcome", "outcome", "resolvedOutcome"]:
+        value = market.get(key)
+        if value in ["Yes", "No"]:
+            return value
+
+    # Certains marchés ont un champ outcomes + outcomePrices
+    outcomes_raw = market.get("outcomes")
+    prices_raw = market.get("outcomePrices")
+
+    try:
+        if isinstance(outcomes_raw, str):
+            outcomes = json.loads(outcomes_raw)
+        else:
+            outcomes = outcomes_raw
+
+        if isinstance(prices_raw, str):
+            prices = json.loads(prices_raw)
+        else:
+            prices = prices_raw
+
+        if outcomes and prices:
+            prices_float = [float(p) for p in prices]
+            max_index = prices_float.index(max(prices_float))
+
+            if max(prices_float) >= 0.99:
+                return outcomes[max_index]
+
+    except Exception as e:
+        print("Erreur extraction winner :", e)
+
+    return None
+
+
 def resolve_paper_trades():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
 
     cursor.execute("""
-        SELECT id, slug, outcome, shares, trade_size
+        SELECT id, slug, outcome, shares, trade_size, title
         FROM paper_trades
         WHERE status = 'OPEN'
     """)
 
     open_trades = cursor.fetchall()
 
-    for trade_id, slug, outcome, shares, trade_size in open_trades:
+    print("Open trades à résoudre :", len(open_trades))
+
+    for trade_id, slug, outcome, shares, trade_size, title in open_trades:
         market = get_market_data(slug)
 
-        if not market or not market.get("closed"):
+        if not market:
+            print("Market introuvable :", slug)
             continue
 
-        winning_outcome = (
-            market.get("winner")
-            or market.get("winningOutcome")
-            or market.get("outcome")
-        )
+        closed = market.get("closed")
+
+        if not closed:
+            continue
+
+        print("MARCHÉ FERMÉ DEBUG")
+        print("Title :", title)
+        print("Slug :", slug)
+        print("Closed :", closed)
+        print("Keys :", list(market.keys()))
+        print("Winner fields :", {
+            "winner": market.get("winner"),
+            "winningOutcome": market.get("winningOutcome"),
+            "outcome": market.get("outcome"),
+            "resolvedOutcome": market.get("resolvedOutcome"),
+            "outcomes": market.get("outcomes"),
+            "outcomePrices": market.get("outcomePrices"),
+        })
+
+        winning_outcome = extract_winning_outcome(market)
+
+        if not winning_outcome:
+            print("Impossible de déterminer le gagnant :", title)
+            continue
 
         if winning_outcome == outcome:
             result = "WIN"
@@ -285,7 +349,7 @@ def resolve_paper_trades():
             WHERE id = ?
         """, (result, pnl, trade_id))
 
-        print(f"✅ Trade résolu : {result} | PnL {pnl}")
+        print(f"✅ Trade résolu : {result} | Winner {winning_outcome} | PnL {pnl}")
 
     conn.commit()
     conn.close()
