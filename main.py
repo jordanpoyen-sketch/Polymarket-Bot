@@ -66,11 +66,30 @@ def init_db():
         )
     """)
 
-    # Migration si la table existait déjà sans tx_hash
-    cursor.execute("PRAGMA table_info(paper_trades)")
-    columns = [col[1] for col in cursor.fetchall()]
+    # Migration raw_trades
+    cursor.execute("PRAGMA table_info(raw_trades)")
+    raw_columns = [col[1] for col in cursor.fetchall()]
 
-    if "tx_hash" not in columns:
+    if "status" not in raw_columns:
+        cursor.execute("ALTER TABLE raw_trades ADD COLUMN status TEXT DEFAULT 'OPEN'")
+
+    if "result" not in raw_columns:
+        cursor.execute("ALTER TABLE raw_trades ADD COLUMN result TEXT DEFAULT ''")
+
+    if "pnl" not in raw_columns:
+        cursor.execute("ALTER TABLE raw_trades ADD COLUMN pnl REAL")
+
+    if "roi" not in raw_columns:
+        cursor.execute("ALTER TABLE raw_trades ADD COLUMN roi REAL")
+
+    if "resolved_at" not in raw_columns:
+        cursor.execute("ALTER TABLE raw_trades ADD COLUMN resolved_at TEXT")
+
+    # Migration paper_trades
+    cursor.execute("PRAGMA table_info(paper_trades)")
+    paper_columns = [col[1] for col in cursor.fetchall()]
+
+    if "tx_hash" not in paper_columns:
         cursor.execute("ALTER TABLE paper_trades ADD COLUMN tx_hash TEXT")
 
     conn.commit()
@@ -85,13 +104,9 @@ def send_telegram_message(message):
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
         requests.get(
             url,
-            params={
-                "chat_id": CHAT_ID,
-                "text": message
-            },
+            params={"chat_id": CHAT_ID, "text": message},
             timeout=10
         )
-
     except Exception as e:
         print("Erreur Telegram :", e)
 
@@ -105,7 +120,6 @@ def get_btc_price():
         if "data" in data and "amount" in data["data"]:
             return float(data["data"]["amount"])
 
-        print("Erreur Coinbase :", data)
         return 0
 
     except Exception as e:
@@ -116,18 +130,13 @@ def get_btc_price():
 def get_wallet_activity(limit=50):
     try:
         url = "https://data-api.polymarket.com/activity"
-
         params = {
             "user": WALLET,
             "limit": limit,
             "offset": 0
         }
 
-        response = requests.get(
-            url,
-            params=params,
-            timeout=20
-        )
+        response = requests.get(url, params=params, timeout=20)
 
         if response.status_code != 200:
             print("Erreur activité :", response.text)
@@ -146,18 +155,9 @@ def get_market_data(slug):
 
     try:
         url = f"https://gamma-api.polymarket.com/markets/slug/{slug}"
-
-        response = requests.get(
-            url,
-            timeout=20
-        )
+        response = requests.get(url, timeout=20)
 
         if response.status_code != 200:
-            print(
-                "Erreur market slug :",
-                response.status_code,
-                response.text
-            )
             return None
 
         return response.json()
@@ -167,16 +167,39 @@ def get_market_data(slug):
         return None
 
 
+def extract_winning_outcome(market):
+    for key in ["winner", "winningOutcome", "outcome", "resolvedOutcome"]:
+        value = market.get(key)
+        if value in ["Yes", "No"]:
+            return value
+
+    outcomes_raw = market.get("outcomes")
+    prices_raw = market.get("outcomePrices")
+
+    try:
+        outcomes = json.loads(outcomes_raw) if isinstance(outcomes_raw, str) else outcomes_raw
+        prices = json.loads(prices_raw) if isinstance(prices_raw, str) else prices_raw
+
+        if outcomes and prices:
+            prices_float = [float(p) for p in prices]
+            max_index = prices_float.index(max(prices_float))
+
+            if max(prices_float) >= 0.99:
+                return outcomes[max_index]
+
+    except Exception as e:
+        print("Erreur extraction winner :", e)
+
+    return None
+
+
 def get_model_signal(btc_price):
     if btc_price > 78000:
         return "bullish"
-
     elif btc_price > 76000:
         return "range_bullish"
-
     elif btc_price > 74000:
         return "neutral"
-
     else:
         return "bearish"
 
@@ -211,11 +234,7 @@ def raw_trade_exists(tx_hash):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
 
-    cursor.execute(
-        "SELECT COUNT(*) FROM raw_trades WHERE tx_hash = ?",
-        (tx_hash,)
-    )
-
+    cursor.execute("SELECT COUNT(*) FROM raw_trades WHERE tx_hash = ?", (tx_hash,))
     exists = cursor.fetchone()[0] > 0
 
     conn.close()
@@ -241,9 +260,14 @@ def save_raw_trade(activity, btc_price):
             price,
             usdc_size,
             side,
-            btc_live
+            btc_live,
+            status,
+            result,
+            pnl,
+            roi,
+            resolved_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         tx_hash,
@@ -253,7 +277,12 @@ def save_raw_trade(activity, btc_price):
         float(activity.get("price") or 0),
         float(activity.get("usdcSize") or 0),
         activity.get("side"),
-        btc_price
+        btc_price,
+        "OPEN",
+        "",
+        None,
+        None,
+        None
     ))
 
     conn.commit()
@@ -317,43 +346,58 @@ def save_paper_trade(activity, btc_price, edge_score):
         return False
 
 
-def extract_winning_outcome(market):
-    for key in [
-        "winner",
-        "winningOutcome",
-        "outcome",
-        "resolvedOutcome"
-    ]:
-        value = market.get(key)
+def resolve_raw_trades():
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
 
-        if value in ["Yes", "No"]:
-            return value
+    cursor.execute("""
+        SELECT id, slug, outcome, price, title
+        FROM raw_trades
+        WHERE status = 'OPEN'
+    """)
 
-    outcomes_raw = market.get("outcomes")
-    prices_raw = market.get("outcomePrices")
+    open_raw = cursor.fetchall()
 
-    try:
-        if isinstance(outcomes_raw, str):
-            outcomes = json.loads(outcomes_raw)
+    for raw_id, slug, outcome, price, title in open_raw:
+        market = get_market_data(slug)
+
+        if not market or not market.get("closed"):
+            continue
+
+        winning_outcome = extract_winning_outcome(market)
+
+        if not winning_outcome:
+            continue
+
+        if winning_outcome == outcome:
+            result = "WIN"
+            pnl = round((1 / float(price)) - 1, 4)
+            roi = round(((1 - float(price)) / float(price)) * 100, 2)
         else:
-            outcomes = outcomes_raw
+            result = "LOSS"
+            pnl = -1
+            roi = -100
 
-        if isinstance(prices_raw, str):
-            prices = json.loads(prices_raw)
-        else:
-            prices = prices_raw
+        cursor.execute("""
+            UPDATE raw_trades
+            SET status = 'CLOSED',
+                result = ?,
+                pnl = ?,
+                roi = ?,
+                resolved_at = ?
+            WHERE id = ?
+        """, (
+            result,
+            pnl,
+            roi,
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            raw_id
+        ))
 
-        if outcomes and prices:
-            prices_float = [float(p) for p in prices]
-            max_index = prices_float.index(max(prices_float))
+        print(f"✅ RAW résolu : {result} | ROI {roi}% | {title}")
 
-            if max(prices_float) >= 0.99:
-                return outcomes[max_index]
-
-    except Exception as e:
-        print("Erreur extraction winner :", e)
-
-    return None
+    conn.commit()
+    conn.close()
 
 
 def resolve_paper_trades():
@@ -361,67 +405,34 @@ def resolve_paper_trades():
     cursor = conn.cursor()
 
     cursor.execute("""
-        SELECT
-            id,
-            slug,
-            outcome,
-            shares,
-            trade_size,
-            title
+        SELECT id, slug, outcome, shares, trade_size, title
         FROM paper_trades
         WHERE status = 'OPEN'
     """)
 
     open_trades = cursor.fetchall()
 
-    print("Open trades à résoudre :", len(open_trades))
-
     for trade_id, slug, outcome, shares, trade_size, title in open_trades:
         market = get_market_data(slug)
 
-        if not market:
-            print("Market introuvable :", slug)
+        if not market or not market.get("closed"):
             continue
-
-        closed = market.get("closed")
-
-        if not closed:
-            continue
-
-        print("MARCHÉ FERMÉ DEBUG")
-        print("Title :", title)
-        print("Slug :", slug)
-        print("Closed :", closed)
-        print("Keys :", list(market.keys()))
-        print("Winner fields :", {
-            "winner": market.get("winner"),
-            "winningOutcome": market.get("winningOutcome"),
-            "outcome": market.get("outcome"),
-            "resolvedOutcome": market.get("resolvedOutcome"),
-            "outcomes": market.get("outcomes"),
-            "outcomePrices": market.get("outcomePrices"),
-        })
 
         winning_outcome = extract_winning_outcome(market)
 
         if not winning_outcome:
-            print("Impossible de déterminer le gagnant :", title)
             continue
 
         if winning_outcome == outcome:
             result = "WIN"
-            pnl = round(
-                float(shares) - float(trade_size),
-                2
-            )
+            pnl = round(float(shares) - float(trade_size), 2)
         else:
             result = "LOSS"
             pnl = -float(trade_size)
 
         cursor.execute("""
             UPDATE paper_trades
-            SET
-                status = 'CLOSED',
+            SET status = 'CLOSED',
                 result = ?,
                 pnl = ?
             WHERE id = ?
@@ -431,11 +442,7 @@ def resolve_paper_trades():
             trade_id
         ))
 
-        print(
-            f"✅ Trade résolu : {result} | "
-            f"Winner {winning_outcome} | "
-            f"PnL {pnl}"
-        )
+        print(f"✅ PAPER résolu : {result} | PnL {pnl} | {title}")
 
     conn.commit()
     conn.close()
@@ -448,27 +455,33 @@ def get_stats():
     cursor.execute("SELECT COUNT(*) FROM raw_trades")
     raw_total = cursor.fetchone()[0]
 
+    cursor.execute("SELECT COUNT(*) FROM raw_trades WHERE status = 'CLOSED'")
+    raw_closed = cursor.fetchone()[0]
+
+    cursor.execute("SELECT COUNT(*) FROM raw_trades WHERE result = 'WIN'")
+    raw_wins = cursor.fetchone()[0]
+
+    cursor.execute("SELECT COUNT(*) FROM raw_trades WHERE result = 'LOSS'")
+    raw_losses = cursor.fetchone()[0]
+
+    cursor.execute("SELECT COALESCE(AVG(roi), 0) FROM raw_trades WHERE status = 'CLOSED'")
+    raw_avg_roi = cursor.fetchone()[0]
+
+    raw_winrate = (raw_wins / raw_closed * 100) if raw_closed else 0
+
     cursor.execute("SELECT COUNT(*) FROM paper_trades")
     total = cursor.fetchone()[0]
 
-    cursor.execute(
-        "SELECT COUNT(*) FROM paper_trades WHERE status = 'OPEN'"
-    )
+    cursor.execute("SELECT COUNT(*) FROM paper_trades WHERE status = 'OPEN'")
     open_count = cursor.fetchone()[0]
 
-    cursor.execute(
-        "SELECT COUNT(*) FROM paper_trades WHERE status = 'CLOSED'"
-    )
+    cursor.execute("SELECT COUNT(*) FROM paper_trades WHERE status = 'CLOSED'")
     closed_count = cursor.fetchone()[0]
 
-    cursor.execute(
-        "SELECT COUNT(*) FROM paper_trades WHERE result = 'WIN'"
-    )
+    cursor.execute("SELECT COUNT(*) FROM paper_trades WHERE result = 'WIN'")
     wins = cursor.fetchone()[0]
 
-    cursor.execute(
-        "SELECT COUNT(*) FROM paper_trades WHERE result = 'LOSS'"
-    )
+    cursor.execute("SELECT COUNT(*) FROM paper_trades WHERE result = 'LOSS'")
     losses = cursor.fetchone()[0]
 
     cursor.execute("""
@@ -478,41 +491,42 @@ def get_stats():
     """)
     pnl = cursor.fetchone()[0]
 
-    winrate = (
-        wins / closed_count * 100
-        if closed_count
-        else 0
-    )
+    winrate = (wins / closed_count * 100) if closed_count else 0
 
     cursor.execute("""
-        SELECT
-            date_opened,
-            title,
-            outcome,
-            entry_price,
-            edge_score,
-            status,
-            result,
-            pnl
+        SELECT date_detected, title, outcome, price, usdc_size, status, result, roi
+        FROM raw_trades
+        ORDER BY id DESC
+        LIMIT 20
+    """)
+    recent_raw = cursor.fetchall()
+
+    cursor.execute("""
+        SELECT date_opened, title, outcome, entry_price, edge_score, status, result, pnl
         FROM paper_trades
         ORDER BY id DESC
         LIMIT 20
     """)
-
-    recent = cursor.fetchall()
+    recent_paper = cursor.fetchall()
 
     conn.close()
 
     return {
         "raw_total": raw_total,
-        "total": total,
-        "open": open_count,
-        "closed": closed_count,
-        "wins": wins,
-        "losses": losses,
-        "pnl": pnl,
-        "winrate": winrate,
-        "recent": recent
+        "raw_closed": raw_closed,
+        "raw_wins": raw_wins,
+        "raw_losses": raw_losses,
+        "raw_winrate": raw_winrate,
+        "raw_avg_roi": raw_avg_roi,
+        "paper_total": total,
+        "paper_open": open_count,
+        "paper_closed": closed_count,
+        "paper_wins": wins,
+        "paper_losses": losses,
+        "paper_pnl": pnl,
+        "paper_winrate": winrate,
+        "recent_raw": recent_raw,
+        "recent_paper": recent_paper
     }
 
 
@@ -524,14 +538,13 @@ def whale_tracker_loop():
 
     while True:
         try:
-            last_scan_time = datetime.now().strftime(
-                "%Y-%m-%d %H:%M:%S"
-            )
+            last_scan_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
             print("\n" + "=" * 60)
             print("SCAN :", last_scan_time)
             print("=" * 60)
 
+            resolve_raw_trades()
             resolve_paper_trades()
 
             latest_edge_signals = []
@@ -553,10 +566,7 @@ def whale_tracker_loop():
                 tx_hash = activity.get("transactionHash")
                 text = title.lower()
 
-                is_btc = (
-                    "bitcoin" in text
-                    or "btc" in text
-                )
+                is_btc = "bitcoin" in text or "btc" in text
 
                 if not (
                     is_btc
@@ -566,10 +576,7 @@ def whale_tracker_loop():
                 ):
                     continue
 
-                is_new = save_raw_trade(
-                    activity,
-                    btc_price
-                )
+                is_new = save_raw_trade(activity, btc_price)
 
                 if not is_new:
                     continue
@@ -581,16 +588,16 @@ def whale_tracker_loop():
                     btc_signal
                 )
 
-                lecture = (
-                    "Whale évite fortement ce scénario"
-                    if outcome == "No"
-                    else "Whale privilégie ce scénario"
-                )
-
                 paper_saved = save_paper_trade(
                     activity,
                     btc_price,
                     edge_score
+                )
+
+                lecture = (
+                    "Whale évite fortement ce scénario"
+                    if outcome == "No"
+                    else "Whale privilégie ce scénario"
                 )
 
                 signal_data = {
@@ -604,9 +611,7 @@ def whale_tracker_loop():
                     "paper_trade": paper_saved
                 }
 
-                latest_edge_signals.append(
-                    signal_data
-                )
+                latest_edge_signals.append(signal_data)
 
                 message = f"""
 🧠 RAW WHALE TRADE
@@ -658,7 +663,6 @@ def dashboard():
     <head>
         <title>Whale Dashboard</title>
         <meta http-equiv="refresh" content="60">
-
         <style>
             body {{
                 background-color: #111;
@@ -666,28 +670,23 @@ def dashboard():
                 font-family: Arial;
                 padding: 20px;
             }}
-
             .card {{
                 background-color: #1c1c1c;
                 padding: 15px;
                 margin-bottom: 15px;
                 border-radius: 10px;
             }}
-
             h1 {{
                 color: orange;
             }}
-
             .win {{
                 color: #00ff99;
             }}
-
             .loss {{
                 color: #ff6666;
             }}
         </style>
     </head>
-
     <body>
         <h1>🐋 Whale Dashboard</h1>
 
@@ -707,15 +706,24 @@ def dashboard():
         </div>
 
         <div class="card">
-            <h2>📊 Backtest Stats</h2>
-            <p>Raw whale trades : {stats["raw_total"]}</p>
-            <p>Paper trades : {stats["total"]}</p>
-            <p>Open : {stats["open"]}</p>
-            <p>Closed : {stats["closed"]}</p>
-            <p>Wins : {stats["wins"]}</p>
-            <p>Losses : {stats["losses"]}</p>
-            <p>Winrate : {stats["winrate"]:.2f}%</p>
-            <p>Total PnL : {stats["pnl"]:.2f} USDC</p>
+            <h2>📊 Raw Whale Trades</h2>
+            <p>Total raw : {stats["raw_total"]}</p>
+            <p>Raw closed : {stats["raw_closed"]}</p>
+            <p>Raw wins : {stats["raw_wins"]}</p>
+            <p>Raw losses : {stats["raw_losses"]}</p>
+            <p>Raw winrate : {stats["raw_winrate"]:.2f}%</p>
+            <p>Raw average ROI : {stats["raw_avg_roi"]:.2f}%</p>
+        </div>
+
+        <div class="card">
+            <h2>📄 Paper Trades</h2>
+            <p>Total paper : {stats["paper_total"]}</p>
+            <p>Open : {stats["paper_open"]}</p>
+            <p>Closed : {stats["paper_closed"]}</p>
+            <p>Wins : {stats["paper_wins"]}</p>
+            <p>Losses : {stats["paper_losses"]}</p>
+            <p>Winrate : {stats["paper_winrate"]:.2f}%</p>
+            <p>Total PnL : {stats["paper_pnl"]:.2f} USDC</p>
         </div>
 
         <h2>🧠 Derniers signaux</h2>
@@ -741,25 +749,30 @@ def dashboard():
         </div>
         """
 
+    html += "<h2>📊 Derniers raw trades</h2>"
+
+    for trade in stats["recent_raw"]:
+        date_detected, title, outcome, price, usdc_size, status, result, roi = trade
+        result_class = "win" if result == "WIN" else "loss"
+
+        html += f"""
+        <div class="card">
+            <h3>{title}</h3>
+            <p>Date : {date_detected}</p>
+            <p>Outcome : {outcome}</p>
+            <p>Prix : {price}</p>
+            <p>Montant whale : {usdc_size:.2f} USDC</p>
+            <p>Status : {status}</p>
+            <p>Result : <span class="{result_class}">{result}</span></p>
+            <p>ROI : {roi}</p>
+        </div>
+        """
+
     html += "<h2>📄 Derniers paper trades</h2>"
 
-    for trade in stats["recent"]:
-        (
-            date_opened,
-            title,
-            outcome,
-            entry_price,
-            edge_score,
-            status,
-            result,
-            pnl
-        ) = trade
-
-        result_class = (
-            "win"
-            if result == "WIN"
-            else "loss"
-        )
+    for trade in stats["recent_paper"]:
+        date_opened, title, outcome, entry_price, edge_score, status, result, pnl = trade
+        result_class = "win" if result == "WIN" else "loss"
 
         html += f"""
         <div class="card">
