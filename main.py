@@ -1215,6 +1215,208 @@ def render_category_table(title, rows):
 
     return html
 
+def get_advanced_analytics():
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT title, outcome, price, usdc_size, result, roi, market_type, quality_signal
+        FROM raw_trades
+        WHERE status = 'CLOSED'
+        ORDER BY id ASC
+    """)
+
+    rows = cursor.fetchall()
+    conn.close()
+
+    cumulative_pnl = 0
+    curve = []
+    strategies = {}
+
+    for i, row in enumerate(rows, start=1):
+        title, outcome, price, usdc_size, result, roi, market_type, quality_signal = row
+
+        bucket = price_bucket(price)
+        quality = "Quality" if quality_signal == 1 else "Excluded"
+        strategy = f"{quality} | {market_type} | {outcome} | {bucket}"
+
+        pnl = float(usdc_size) * float(roi or 0) / 100 if result == "WIN" else -float(usdc_size)
+        cumulative_pnl += pnl
+
+        curve.append((i, round(cumulative_pnl, 2)))
+
+        if strategy not in strategies:
+            strategies[strategy] = {
+                "count": 0,
+                "wins": 0,
+                "losses": 0,
+                "weighted_pnl": 0,
+                "total_size": 0
+            }
+
+        strategies[strategy]["count"] += 1
+        strategies[strategy]["total_size"] += float(usdc_size)
+        strategies[strategy]["weighted_pnl"] += pnl
+
+        if result == "WIN":
+            strategies[strategy]["wins"] += 1
+        elif result == "LOSS":
+            strategies[strategy]["losses"] += 1
+
+    top_strategies = []
+
+    for name, data in strategies.items():
+        count = data["count"]
+        total_size = data["total_size"]
+        winrate = data["wins"] / count * 100 if count else 0
+        weighted_roi = data["weighted_pnl"] / total_size * 100 if total_size else 0
+
+        top_strategies.append({
+            "name": name,
+            "count": count,
+            "wins": data["wins"],
+            "losses": data["losses"],
+            "winrate": winrate,
+            "weighted_roi": weighted_roi,
+            "weighted_pnl": data["weighted_pnl"]
+        })
+
+    top_strategies = sorted(
+        top_strategies,
+        key=lambda x: x["weighted_roi"],
+        reverse=True
+    )
+
+    def rolling_winrate(n):
+        sample = rows[-n:]
+        if not sample:
+            return 0
+
+        wins = sum(1 for r in sample if r[4] == "WIN")
+        return wins / len(sample) * 100
+
+    closed_count = len(rows)
+    positive_strategies = len([s for s in top_strategies if s["weighted_roi"] > 0])
+    best_roi = top_strategies[0]["weighted_roi"] if top_strategies else 0
+
+    confidence_score = min(
+        100,
+        max(
+            0,
+            (closed_count / 10)
+            + best_roi
+            + positive_strategies * 3
+        )
+    )
+
+    return {
+        "top_strategies": top_strategies[:15],
+        "curve": curve[-50:],
+        "rolling_20": rolling_winrate(20),
+        "rolling_50": rolling_winrate(50),
+        "rolling_100": rolling_winrate(100),
+        "confidence_score": confidence_score
+    }
+
+
+@app.get("/analytics", response_class=HTMLResponse)
+def analytics():
+    data = get_advanced_analytics()
+
+    html = """
+    <html>
+    <head>
+        <title>Whale Analytics</title>
+        <meta http-equiv="refresh" content="60">
+        <style>
+            body {
+                background-color: #111;
+                color: white;
+                font-family: Arial;
+                padding: 20px;
+            }
+            .card {
+                background-color: #1c1c1c;
+                padding: 15px;
+                margin-bottom: 15px;
+                border-radius: 10px;
+            }
+            h1 {
+                color: orange;
+            }
+            table {
+                width: 100%;
+                color: white;
+                border-collapse: collapse;
+            }
+            th, td {
+                border: 1px solid #555;
+                padding: 6px;
+            }
+        </style>
+    </head>
+    <body>
+        <h1>📊 Advanced Whale Analytics</h1>
+    """
+
+    html += f"""
+        <div class="card">
+            <h2>🧠 Confidence Score</h2>
+            <h1>{data["confidence_score"]:.1f}/100</h1>
+        </div>
+
+        <div class="card">
+            <h2>📈 Rolling Winrate</h2>
+            <p>Last 20 trades : {data["rolling_20"]:.2f}%</p>
+            <p>Last 50 trades : {data["rolling_50"]:.2f}%</p>
+            <p>Last 100 trades : {data["rolling_100"]:.2f}%</p>
+        </div>
+
+        <div class="card">
+            <h2>📉 Cumulative PnL Curve — last 50 points</h2>
+    """
+
+    for point, pnl in data["curve"]:
+        html += f"<p>Trade {point} : {pnl}</p>"
+
+    html += """
+        </div>
+
+        <div class="card">
+            <h2>🏆 Top Strategies</h2>
+            <table>
+                <tr>
+                    <th>Strategy</th>
+                    <th>Trades</th>
+                    <th>Wins</th>
+                    <th>Losses</th>
+                    <th>Winrate</th>
+                    <th>Weighted ROI</th>
+                    <th>Weighted PnL</th>
+                </tr>
+    """
+
+    for s in data["top_strategies"]:
+        html += f"""
+                <tr>
+                    <td>{s["name"]}</td>
+                    <td>{s["count"]}</td>
+                    <td>{s["wins"]}</td>
+                    <td>{s["losses"]}</td>
+                    <td>{s["winrate"]:.2f}%</td>
+                    <td>{s["weighted_roi"]:.2f}%</td>
+                    <td>{s["weighted_pnl"]:.2f}</td>
+                </tr>
+        """
+
+    html += """
+            </table>
+        </div>
+    </body>
+    </html>
+    """
+
+    return html
 
 @app.get("/", response_class=HTMLResponse)
 def dashboard():
