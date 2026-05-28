@@ -6,7 +6,7 @@ import time
 import os
 import sqlite3
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 
 
 app = FastAPI()
@@ -25,6 +25,10 @@ DB_PATH = "/data/paper_trades.db"
 latest_edge_signals = []
 last_scan_time = "Aucun scan"
 
+
+# --------------------------
+# DATABASE
+# --------------------------
 
 def init_db():
     os.makedirs("/data", exist_ok=True)
@@ -69,16 +73,24 @@ def init_db():
     cursor.execute("PRAGMA table_info(raw_trades)")
     raw_columns = [col[1] for col in cursor.fetchall()]
 
-    if "status" not in raw_columns:
-        cursor.execute("ALTER TABLE raw_trades ADD COLUMN status TEXT DEFAULT 'OPEN'")
-    if "result" not in raw_columns:
-        cursor.execute("ALTER TABLE raw_trades ADD COLUMN result TEXT DEFAULT ''")
-    if "pnl" not in raw_columns:
-        cursor.execute("ALTER TABLE raw_trades ADD COLUMN pnl REAL")
-    if "roi" not in raw_columns:
-        cursor.execute("ALTER TABLE raw_trades ADD COLUMN roi REAL")
-    if "resolved_at" not in raw_columns:
-        cursor.execute("ALTER TABLE raw_trades ADD COLUMN resolved_at TEXT")
+    migrations = {
+        "status": "ALTER TABLE raw_trades ADD COLUMN status TEXT DEFAULT 'OPEN'",
+        "result": "ALTER TABLE raw_trades ADD COLUMN result TEXT DEFAULT ''",
+        "pnl": "ALTER TABLE raw_trades ADD COLUMN pnl REAL",
+        "roi": "ALTER TABLE raw_trades ADD COLUMN roi REAL",
+        "resolved_at": "ALTER TABLE raw_trades ADD COLUMN resolved_at TEXT",
+        "market_type": "ALTER TABLE raw_trades ADD COLUMN market_type TEXT",
+        "quality_signal": "ALTER TABLE raw_trades ADD COLUMN quality_signal INTEGER DEFAULT 0",
+        "reinforcement_count": "ALTER TABLE raw_trades ADD COLUMN reinforcement_count INTEGER DEFAULT 1",
+        "cumulative_size": "ALTER TABLE raw_trades ADD COLUMN cumulative_size REAL DEFAULT 0",
+        "time_before_expiry_minutes": "ALTER TABLE raw_trades ADD COLUMN time_before_expiry_minutes REAL",
+        "aggressiveness_score": "ALTER TABLE raw_trades ADD COLUMN aggressiveness_score INTEGER DEFAULT 1",
+        "entry_timing": "ALTER TABLE raw_trades ADD COLUMN entry_timing TEXT"
+    }
+
+    for column, sql in migrations.items():
+        if column not in raw_columns:
+            cursor.execute(sql)
 
     cursor.execute("""
         UPDATE raw_trades
@@ -96,16 +108,32 @@ def init_db():
     conn.close()
 
 
+# --------------------------
+# TELEGRAM
+# --------------------------
+
 def send_telegram_message(message):
     if not BOT_TOKEN or not CHAT_ID:
         return
 
     try:
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-        requests.get(url, params={"chat_id": CHAT_ID, "text": message}, timeout=10)
+        requests.get(
+            url,
+            params={
+                "chat_id": CHAT_ID,
+                "text": message
+            },
+            timeout=10
+        )
+
     except Exception as e:
         print("Erreur Telegram :", e)
 
+
+# --------------------------
+# BTC PRICE
+# --------------------------
 
 def get_btc_price():
     try:
@@ -123,16 +151,25 @@ def get_btc_price():
         return 0
 
 
+# --------------------------
+# POLYMARKET API
+# --------------------------
+
 def get_wallet_activity(limit=50):
     try:
         url = "https://data-api.polymarket.com/activity"
+
         params = {
             "user": WALLET,
             "limit": limit,
             "offset": 0
         }
 
-        response = requests.get(url, params=params, timeout=20)
+        response = requests.get(
+            url,
+            params=params,
+            timeout=20
+        )
 
         if response.status_code != 200:
             print("Erreur activité :", response.text)
@@ -163,9 +200,19 @@ def get_market_data(slug):
         return None
 
 
+# --------------------------
+# MARKET RESOLUTION
+# --------------------------
+
 def extract_winning_outcome(market):
-    for key in ["winner", "winningOutcome", "outcome", "resolvedOutcome"]:
+    for key in [
+        "winner",
+        "winningOutcome",
+        "outcome",
+        "resolvedOutcome"
+    ]:
         value = market.get(key)
+
         if value in ["Yes", "No"]:
             return value
 
@@ -173,8 +220,17 @@ def extract_winning_outcome(market):
     prices_raw = market.get("outcomePrices")
 
     try:
-        outcomes = json.loads(outcomes_raw) if isinstance(outcomes_raw, str) else outcomes_raw
-        prices = json.loads(prices_raw) if isinstance(prices_raw, str) else prices_raw
+        outcomes = (
+            json.loads(outcomes_raw)
+            if isinstance(outcomes_raw, str)
+            else outcomes_raw
+        )
+
+        prices = (
+            json.loads(prices_raw)
+            if isinstance(prices_raw, str)
+            else prices_raw
+        )
 
         if outcomes and prices:
             prices_float = [float(p) for p in prices]
@@ -189,41 +245,22 @@ def extract_winning_outcome(market):
     return None
 
 
+# --------------------------
+# CLASSIFICATION
+# --------------------------
+
 def get_model_signal(btc_price):
     if btc_price > 78000:
         return "bullish"
+
     elif btc_price > 76000:
         return "range_bullish"
+
     elif btc_price > 74000:
         return "neutral"
+
     else:
         return "bearish"
-
-
-def calculate_edge_score(outcome, price, usdc_size, btc_signal):
-    score = 0
-
-    if usdc_size > 1000:
-        score += 3
-    elif usdc_size > 500:
-        score += 2
-    elif usdc_size > 100:
-        score += 1
-
-    if price > 0.97:
-        score += 3
-    elif price > 0.93:
-        score += 2
-    elif price > 0.88:
-        score += 1
-
-    if btc_signal in ["bullish", "range_bullish"] and outcome == "Yes":
-        score += 2
-
-    if btc_signal == "bearish" and outcome == "No":
-        score += 2
-
-    return min(score, 10)
 
 
 def classify_market(title):
@@ -231,12 +268,16 @@ def classify_market(title):
 
     if "reach" in text:
         return "Reach"
+
     if "dip" in text:
         return "Dip"
+
     if "above" in text:
         return "Above"
+
     if "below" in text:
         return "Below"
+
     if "between" in text:
         return "Range"
 
@@ -263,20 +304,173 @@ def price_bucket(price):
 
     if price < 0.70:
         return "0.50-0.70"
+
     if price < 0.90:
         return "0.70-0.90"
 
     return "0.90+"
 
 
+def calculate_edge_score(outcome, price, usdc_size, btc_signal):
+    score = 0
+
+    if usdc_size > 1000:
+        score += 3
+
+    elif usdc_size > 500:
+        score += 2
+
+    elif usdc_size > 100:
+        score += 1
+
+    if price > 0.97:
+        score += 3
+
+    elif price > 0.93:
+        score += 2
+
+    elif price > 0.88:
+        score += 1
+
+    if btc_signal in ["bullish", "range_bullish"] and outcome == "Yes":
+        score += 2
+
+    if btc_signal == "bearish" and outcome == "No":
+        score += 2
+
+    return min(score, 10)
+
+
+# --------------------------
+# ADVANCED FEATURES
+# --------------------------
+
+def parse_iso_datetime(value):
+    if not value:
+        return None
+
+    try:
+        value = value.replace("Z", "+00:00")
+        return datetime.fromisoformat(value)
+
+    except Exception:
+        return None
+
+
+def calculate_time_before_expiry_minutes(slug):
+    market = get_market_data(slug)
+
+    if not market:
+        return None
+
+    end_date = (
+        market.get("endDateIso")
+        or market.get("endDate")
+        or market.get("umaEndDate")
+    )
+
+    end_dt = parse_iso_datetime(end_date)
+
+    if not end_dt:
+        return None
+
+    now = datetime.now(timezone.utc)
+
+    if end_dt.tzinfo is None:
+        end_dt = end_dt.replace(tzinfo=timezone.utc)
+
+    diff = end_dt - now
+
+    return round(diff.total_seconds() / 60, 2)
+
+
+def classify_entry_timing(minutes):
+    if minutes is None:
+        return "Unknown"
+
+    if minutes <= 30:
+        return "Very Late"
+
+    if minutes <= 120:
+        return "Late"
+
+    if minutes <= 720:
+        return "Mid"
+
+    return "Early"
+
+
+def calculate_reinforcement_features(title, outcome):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT COUNT(*), COALESCE(SUM(usdc_size), 0)
+        FROM raw_trades
+        WHERE title = ?
+        AND outcome = ?
+    """, (
+        title,
+        outcome
+    ))
+
+    count, cumulative_size = cursor.fetchone()
+
+    conn.close()
+
+    return int(count) + 1, float(cumulative_size or 0)
+
+
+def calculate_aggressiveness_score(title, outcome):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT COUNT(*)
+        FROM raw_trades
+        WHERE title = ?
+        AND outcome = ?
+        AND datetime(date_detected) >= datetime('now', '-10 minutes')
+    """, (
+        title,
+        outcome
+    ))
+
+    recent_count = cursor.fetchone()[0]
+
+    conn.close()
+
+    if recent_count >= 10:
+        return 5
+
+    if recent_count >= 5:
+        return 4
+
+    if recent_count >= 3:
+        return 3
+
+    if recent_count >= 1:
+        return 2
+
+    return 1
+
+# --------------------------
+# SAVE RAW / PAPER TRADES
+# --------------------------
+
 def raw_trade_exists(tx_hash):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
 
-    cursor.execute("SELECT COUNT(*) FROM raw_trades WHERE tx_hash = ?", (tx_hash,))
+    cursor.execute(
+        "SELECT COUNT(*) FROM raw_trades WHERE tx_hash = ?",
+        (tx_hash,)
+    )
+
     exists = cursor.fetchone()[0] > 0
 
     conn.close()
+
     return exists
 
 
@@ -285,6 +479,30 @@ def save_raw_trade(activity, btc_price):
 
     if not tx_hash or raw_trade_exists(tx_hash):
         return False
+
+    title = activity.get("title")
+    slug = activity.get("slug") or ""
+    outcome = activity.get("outcome")
+    price = float(activity.get("price") or 0)
+    usdc_size = float(activity.get("usdcSize") or 0)
+
+    market_type = classify_market(title)
+    quality_signal = 1 if is_quality_signal(title, outcome) else 0
+
+    reinforcement_count, previous_cumulative_size = calculate_reinforcement_features(
+        title,
+        outcome
+    )
+
+    cumulative_size = previous_cumulative_size + usdc_size
+
+    time_before_expiry = calculate_time_before_expiry_minutes(slug)
+    entry_timing = classify_entry_timing(time_before_expiry)
+
+    aggressiveness_score = calculate_aggressiveness_score(
+        title,
+        outcome
+    )
 
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
@@ -304,24 +522,38 @@ def save_raw_trade(activity, btc_price):
             result,
             pnl,
             roi,
-            resolved_at
+            resolved_at,
+            market_type,
+            quality_signal,
+            reinforcement_count,
+            cumulative_size,
+            time_before_expiry_minutes,
+            aggressiveness_score,
+            entry_timing
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         tx_hash,
-        activity.get("title"),
-        activity.get("slug") or "",
-        activity.get("outcome"),
-        float(activity.get("price") or 0),
-        float(activity.get("usdcSize") or 0),
+        title,
+        slug,
+        outcome,
+        price,
+        usdc_size,
         activity.get("side"),
         btc_price,
         "OPEN",
         "",
         None,
         None,
-        None
+        None,
+        market_type,
+        quality_signal,
+        reinforcement_count,
+        cumulative_size,
+        time_before_expiry,
+        aggressiveness_score,
+        entry_timing
     ))
 
     conn.commit()
@@ -378,12 +610,17 @@ def save_paper_trade(activity, btc_price, edge_score):
 
         conn.commit()
         conn.close()
+
         return True
 
     except sqlite3.IntegrityError:
         conn.close()
         return False
 
+
+# --------------------------
+# RESOLVERS
+# --------------------------
 
 def resolve_raw_trades():
     conn = sqlite3.connect(DB_PATH)
@@ -487,12 +724,26 @@ def resolve_paper_trades():
     conn.close()
 
 
+# --------------------------
+# ANALYTICS
+# --------------------------
+
 def get_category_stats(group_field):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
 
     cursor.execute("""
-        SELECT title, outcome, price, usdc_size, result, roi
+        SELECT
+            title,
+            outcome,
+            price,
+            usdc_size,
+            result,
+            roi,
+            market_type,
+            quality_signal,
+            entry_timing,
+            aggressiveness_score
         FROM raw_trades
         WHERE status = 'CLOSED'
     """)
@@ -502,15 +753,37 @@ def get_category_stats(group_field):
 
     groups = {}
 
-    for title, outcome, price, usdc_size, result, roi in rows:
+    for (
+        title,
+        outcome,
+        price,
+        usdc_size,
+        result,
+        roi,
+        market_type,
+        quality_signal,
+        entry_timing,
+        aggressiveness_score
+    ) in rows:
+
         if group_field == "outcome":
             key = outcome
+
         elif group_field == "price":
             key = price_bucket(price)
+
         elif group_field == "market":
-            key = classify_market(title)
+            key = market_type or classify_market(title)
+
         elif group_field == "quality":
-            key = "Quality" if is_quality_signal(title, outcome) else "Excluded"
+            key = "Quality" if quality_signal == 1 else "Excluded"
+
+        elif group_field == "timing":
+            key = entry_timing or "Unknown"
+
+        elif group_field == "aggressiveness":
+            key = f"Score {aggressiveness_score}"
+
         else:
             key = "Other"
 
@@ -528,13 +801,17 @@ def get_category_stats(group_field):
 
         if result == "WIN":
             groups[key]["wins"] += 1
+
         elif result == "LOSS":
             groups[key]["losses"] += 1
 
         groups[key]["roi_sum"] += float(roi or 0)
 
         if result == "WIN":
-            groups[key]["weighted_pnl"] += float(usdc_size) * float(roi or 0) / 100
+            groups[key]["weighted_pnl"] += (
+                float(usdc_size) * float(roi or 0) / 100
+            )
+
         elif result == "LOSS":
             groups[key]["weighted_pnl"] -= float(usdc_size)
 
@@ -547,9 +824,23 @@ def get_category_stats(group_field):
         wins = data["wins"]
         total_size = data["total_size"]
 
-        winrate = (wins / count * 100) if count else 0
-        avg_roi = (data["roi_sum"] / count) if count else 0
-        weighted_roi = (data["weighted_pnl"] / total_size * 100) if total_size else 0
+        winrate = (
+            wins / count * 100
+            if count
+            else 0
+        )
+
+        avg_roi = (
+            data["roi_sum"] / count
+            if count
+            else 0
+        )
+
+        weighted_roi = (
+            data["weighted_pnl"] / total_size * 100
+            if total_size
+            else 0
+        )
 
         final.append({
             "name": key,
@@ -563,7 +854,11 @@ def get_category_stats(group_field):
             "total_size": total_size
         })
 
-    return sorted(final, key=lambda x: x["count"], reverse=True)
+    return sorted(
+        final,
+        key=lambda x: x["count"],
+        reverse=True
+    )
 
 
 def get_stats():
@@ -582,10 +877,18 @@ def get_stats():
     cursor.execute("SELECT COUNT(*) FROM raw_trades WHERE result = 'LOSS'")
     raw_losses = cursor.fetchone()[0]
 
-    cursor.execute("SELECT COALESCE(AVG(roi), 0) FROM raw_trades WHERE status = 'CLOSED'")
+    cursor.execute("""
+        SELECT COALESCE(AVG(roi), 0)
+        FROM raw_trades
+        WHERE status = 'CLOSED'
+    """)
     raw_avg_roi = cursor.fetchone()[0]
 
-    raw_winrate = (raw_wins / raw_closed * 100) if raw_closed else 0
+    raw_winrate = (
+        raw_wins / raw_closed * 100
+        if raw_closed
+        else 0
+    )
 
     cursor.execute("""
         SELECT COALESCE(SUM(
@@ -608,7 +911,7 @@ def get_stats():
     total_weight = cursor.fetchone()[0]
 
     weighted_roi = (
-        (weighted_pnl / total_weight) * 100
+        weighted_pnl / total_weight * 100
         if total_weight > 0
         else 0
     )
@@ -649,22 +952,51 @@ def get_stats():
     """)
     paper_pnl = cursor.fetchone()[0]
 
-    paper_winrate = (paper_wins / paper_closed * 100) if paper_closed else 0
+    paper_winrate = (
+        paper_wins / paper_closed * 100
+        if paper_closed
+        else 0
+    )
 
     cursor.execute("""
-        SELECT date_detected, title, outcome, price, usdc_size, status, result, roi
+        SELECT
+            date_detected,
+            title,
+            outcome,
+            price,
+            usdc_size,
+            status,
+            result,
+            roi,
+            market_type,
+            quality_signal,
+            reinforcement_count,
+            cumulative_size,
+            time_before_expiry_minutes,
+            aggressiveness_score,
+            entry_timing
         FROM raw_trades
         ORDER BY id DESC
         LIMIT 20
     """)
+
     recent_raw = cursor.fetchall()
 
     cursor.execute("""
-        SELECT date_opened, title, outcome, entry_price, edge_score, status, result, pnl
+        SELECT
+            date_opened,
+            title,
+            outcome,
+            entry_price,
+            edge_score,
+            status,
+            result,
+            pnl
         FROM paper_trades
         ORDER BY id DESC
         LIMIT 20
     """)
+
     recent_paper = cursor.fetchall()
 
     conn.close()
@@ -692,9 +1024,15 @@ def get_stats():
         "by_outcome": get_category_stats("outcome"),
         "by_price": get_category_stats("price"),
         "by_market": get_category_stats("market"),
-        "by_quality": get_category_stats("quality")
+        "by_quality": get_category_stats("quality"),
+        "by_timing": get_category_stats("timing"),
+        "by_aggressiveness": get_category_stats("aggressiveness")
     }
 
+
+# --------------------------
+# MAIN LOOP
+# --------------------------
 
 def whale_tracker_loop():
     global latest_edge_signals
@@ -732,7 +1070,10 @@ def whale_tracker_loop():
                 tx_hash = activity.get("transactionHash")
                 text = title.lower()
 
-                is_btc = "bitcoin" in text or "btc" in text
+                is_btc = (
+                    "bitcoin" in text
+                    or "btc" in text
+                )
 
                 if not (
                     is_btc
@@ -742,7 +1083,10 @@ def whale_tracker_loop():
                 ):
                     continue
 
-                is_new = save_raw_trade(activity, btc_price)
+                is_new = save_raw_trade(
+                    activity,
+                    btc_price
+                )
 
                 if not is_new:
                     continue
@@ -782,7 +1126,9 @@ def whale_tracker_loop():
                     "quality": quality
                 }
 
-                latest_edge_signals.append(signal_data)
+                latest_edge_signals.append(
+                    signal_data
+                )
 
                 message = f"""
 🧠 RAW WHALE TRADE
@@ -826,6 +1172,10 @@ Lecture :
         print("Prochain scan dans 60 secondes...")
         time.sleep(60)
 
+
+# --------------------------
+# DASHBOARD
+# --------------------------
 
 def render_category_table(title, rows):
     html = f"""
@@ -955,6 +1305,8 @@ def dashboard():
     html += render_category_table("📊 Analyse YES vs NO", stats["by_outcome"])
     html += render_category_table("📊 Analyse par prix", stats["by_price"])
     html += render_category_table("📊 Analyse par type de marché", stats["by_market"])
+    html += render_category_table("🕒 Analyse Entry Timing", stats["by_timing"])
+    html += render_category_table("🔥 Analyse Aggressiveness", stats["by_aggressiveness"])
 
     html += "<h2>🧠 Derniers signaux</h2>"
 
@@ -983,10 +1335,25 @@ def dashboard():
     html += "<h2>📊 Derniers raw trades</h2>"
 
     for trade in stats["recent_raw"]:
-        date_detected, title, outcome, price, usdc_size, status, result, roi = trade
+        (
+            date_detected,
+            title,
+            outcome,
+            price,
+            usdc_size,
+            status,
+            result,
+            roi,
+            market_type,
+            quality_signal,
+            reinforcement_count,
+            cumulative_size,
+            time_before_expiry,
+            aggressiveness_score,
+            entry_timing
+        ) = trade
+
         result_class = "win" if result == "WIN" else "loss"
-        quality = is_quality_signal(title, outcome)
-        market_type = classify_market(title)
 
         html += f"""
         <div class="card">
@@ -994,9 +1361,14 @@ def dashboard():
             <p>Date : {date_detected}</p>
             <p>Outcome : {outcome}</p>
             <p>Market type : {market_type}</p>
-            <p>Quality Signal : {quality}</p>
+            <p>Quality Signal : {bool(quality_signal)}</p>
             <p>Prix : {price}</p>
             <p>Montant whale : {usdc_size:.2f} USDC</p>
+            <p>Reinforcement count : {reinforcement_count}</p>
+            <p>Cumulative size : {cumulative_size:.2f} USDC</p>
+            <p>Time before expiry : {time_before_expiry} min</p>
+            <p>Entry timing : {entry_timing}</p>
+            <p>Aggressiveness score : {aggressiveness_score}/5</p>
             <p>Status : {status}</p>
             <p>Result : <span class="{result_class}">{result}</span></p>
             <p>ROI : {roi}</p>
@@ -1006,7 +1378,17 @@ def dashboard():
     html += "<h2>📄 Derniers paper trades</h2>"
 
     for trade in stats["recent_paper"]:
-        date_opened, title, outcome, entry_price, edge_score, status, result, pnl = trade
+        (
+            date_opened,
+            title,
+            outcome,
+            entry_price,
+            edge_score,
+            status,
+            result,
+            pnl
+        ) = trade
+
         result_class = "win" if result == "WIN" else "loss"
 
         html += f"""
