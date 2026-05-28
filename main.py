@@ -66,26 +66,26 @@ def init_db():
         )
     """)
 
-    # Migration raw_trades
     cursor.execute("PRAGMA table_info(raw_trades)")
     raw_columns = [col[1] for col in cursor.fetchall()]
 
     if "status" not in raw_columns:
         cursor.execute("ALTER TABLE raw_trades ADD COLUMN status TEXT DEFAULT 'OPEN'")
-
     if "result" not in raw_columns:
         cursor.execute("ALTER TABLE raw_trades ADD COLUMN result TEXT DEFAULT ''")
-
     if "pnl" not in raw_columns:
         cursor.execute("ALTER TABLE raw_trades ADD COLUMN pnl REAL")
-
     if "roi" not in raw_columns:
         cursor.execute("ALTER TABLE raw_trades ADD COLUMN roi REAL")
-
     if "resolved_at" not in raw_columns:
         cursor.execute("ALTER TABLE raw_trades ADD COLUMN resolved_at TEXT")
 
-    # Migration paper_trades
+    cursor.execute("""
+        UPDATE raw_trades
+        SET status = 'OPEN'
+        WHERE status IS NULL OR status = ''
+    """)
+
     cursor.execute("PRAGMA table_info(paper_trades)")
     paper_columns = [col[1] for col in cursor.fetchall()]
 
@@ -102,11 +102,7 @@ def send_telegram_message(message):
 
     try:
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-        requests.get(
-            url,
-            params={"chat_id": CHAT_ID, "text": message},
-            timeout=10
-        )
+        requests.get(url, params={"chat_id": CHAT_ID, "text": message}, timeout=10)
     except Exception as e:
         print("Erreur Telegram :", e)
 
@@ -469,29 +465,69 @@ def get_stats():
 
     raw_winrate = (raw_wins / raw_closed * 100) if raw_closed else 0
 
+    cursor.execute("""
+        SELECT COALESCE(SUM(
+            CASE
+                WHEN result = 'WIN'
+                THEN usdc_size * roi / 100
+                ELSE usdc_size * -1
+            END
+        ), 0)
+        FROM raw_trades
+        WHERE status = 'CLOSED'
+    """)
+    weighted_pnl = cursor.fetchone()[0]
+
+    cursor.execute("""
+        SELECT COALESCE(SUM(usdc_size), 0)
+        FROM raw_trades
+        WHERE status = 'CLOSED'
+    """)
+    total_weight = cursor.fetchone()[0]
+
+    weighted_roi = (
+        (weighted_pnl / total_weight) * 100
+        if total_weight > 0
+        else 0
+    )
+
+    cursor.execute("""
+        SELECT COALESCE(AVG(usdc_size), 0)
+        FROM raw_trades
+        WHERE result = 'WIN'
+    """)
+    avg_win_size = cursor.fetchone()[0]
+
+    cursor.execute("""
+        SELECT COALESCE(AVG(usdc_size), 0)
+        FROM raw_trades
+        WHERE result = 'LOSS'
+    """)
+    avg_loss_size = cursor.fetchone()[0]
+
     cursor.execute("SELECT COUNT(*) FROM paper_trades")
-    total = cursor.fetchone()[0]
+    paper_total = cursor.fetchone()[0]
 
     cursor.execute("SELECT COUNT(*) FROM paper_trades WHERE status = 'OPEN'")
-    open_count = cursor.fetchone()[0]
+    paper_open = cursor.fetchone()[0]
 
     cursor.execute("SELECT COUNT(*) FROM paper_trades WHERE status = 'CLOSED'")
-    closed_count = cursor.fetchone()[0]
+    paper_closed = cursor.fetchone()[0]
 
     cursor.execute("SELECT COUNT(*) FROM paper_trades WHERE result = 'WIN'")
-    wins = cursor.fetchone()[0]
+    paper_wins = cursor.fetchone()[0]
 
     cursor.execute("SELECT COUNT(*) FROM paper_trades WHERE result = 'LOSS'")
-    losses = cursor.fetchone()[0]
+    paper_losses = cursor.fetchone()[0]
 
     cursor.execute("""
         SELECT COALESCE(SUM(pnl), 0)
         FROM paper_trades
         WHERE status = 'CLOSED'
     """)
-    pnl = cursor.fetchone()[0]
+    paper_pnl = cursor.fetchone()[0]
 
-    winrate = (wins / closed_count * 100) if closed_count else 0
+    paper_winrate = (paper_wins / paper_closed * 100) if paper_closed else 0
 
     cursor.execute("""
         SELECT date_detected, title, outcome, price, usdc_size, status, result, roi
@@ -518,13 +554,17 @@ def get_stats():
         "raw_losses": raw_losses,
         "raw_winrate": raw_winrate,
         "raw_avg_roi": raw_avg_roi,
-        "paper_total": total,
-        "paper_open": open_count,
-        "paper_closed": closed_count,
-        "paper_wins": wins,
-        "paper_losses": losses,
-        "paper_pnl": pnl,
-        "paper_winrate": winrate,
+        "weighted_pnl": weighted_pnl,
+        "weighted_roi": weighted_roi,
+        "avg_win_size": avg_win_size,
+        "avg_loss_size": avg_loss_size,
+        "paper_total": paper_total,
+        "paper_open": paper_open,
+        "paper_closed": paper_closed,
+        "paper_wins": paper_wins,
+        "paper_losses": paper_losses,
+        "paper_pnl": paper_pnl,
+        "paper_winrate": paper_winrate,
         "recent_raw": recent_raw,
         "recent_paper": recent_paper
     }
@@ -713,6 +753,11 @@ def dashboard():
             <p>Raw losses : {stats["raw_losses"]}</p>
             <p>Raw winrate : {stats["raw_winrate"]:.2f}%</p>
             <p>Raw average ROI : {stats["raw_avg_roi"]:.2f}%</p>
+            <hr>
+            <p><b>Weighted whale PnL : {stats["weighted_pnl"]:.2f}</b></p>
+            <p><b>Weighted whale ROI : {stats["weighted_roi"]:.2f}%</b></p>
+            <p>Average WIN size : {stats["avg_win_size"]:.2f} USDC</p>
+            <p>Average LOSS size : {stats["avg_loss_size"]:.2f} USDC</p>
         </div>
 
         <div class="card">
