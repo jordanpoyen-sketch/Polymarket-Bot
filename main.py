@@ -1563,27 +1563,33 @@ def analytics():
                 font-family: Arial;
                 padding: 20px;
             }
+
             .card {
                 background-color: #1c1c1c;
                 padding: 15px;
                 margin-bottom: 15px;
                 border-radius: 10px;
             }
+
             h1 {
                 color: orange;
             }
+
             table {
                 width: 100%;
                 color: white;
                 border-collapse: collapse;
             }
+
             th, td {
                 border: 1px solid #555;
                 padding: 6px;
             }
         </style>
     </head>
+
     <body>
+
         <h1>📊 Advanced Whale Analytics</h1>
     """
 
@@ -1601,19 +1607,38 @@ def analytics():
         </div>
     """
 
-    html += render_curve("📉 Total Cumulative PnL — last 50", data["total_curve"])
-    html += render_curve("✅ Quality Cumulative PnL — last 50", data["quality_curve"])
-    html += render_curve("❌ Excluded Cumulative PnL — last 50", data["excluded_curve"])
+    html += render_curve(
+        "📉 Total Cumulative PnL — last 50",
+        data["total_curve"]
+    )
+
+    html += render_curve(
+        "✅ Quality Cumulative PnL — last 50",
+        data["quality_curve"]
+    )
+
+    html += render_curve(
+        "❌ Excluded Cumulative PnL — last 50",
+        data["excluded_curve"]
+    )
 
     html += render_category_table(
         "🔁 Reinforcement Analytics",
         get_category_stats("reinforcement")
     )
 
+    html += render_category_table(
+        "💰 Cumulative Size Analytics",
+        get_category_stats("cumulative_size")
+    )
+
     html += """
         <div class="card">
+
             <h2>🏆 Top Strategies min 20 trades</h2>
+
             <table>
+
                 <tr>
                     <th>Strategy</th>
                     <th>Trades</th>
@@ -1626,27 +1651,32 @@ def analytics():
     """
 
     for s in data["top_strategies"]:
+
         html += f"""
-                <tr>
-                    <td>{s["name"]}</td>
-                    <td>{s["count"]}</td>
-                    <td>{s["wins"]}</td>
-                    <td>{s["losses"]}</td>
-                    <td>{s["winrate"]:.2f}%</td>
-                    <td>{s["weighted_roi"]:.2f}%</td>
-                    <td>{s["weighted_pnl"]:.2f}</td>
-                </tr>
+            <tr>
+                <td>{s["name"]}</td>
+                <td>{s["count"]}</td>
+                <td>{s["wins"]}</td>
+                <td>{s["losses"]}</td>
+                <td>{s["winrate"]:.2f}%</td>
+                <td>{s["weighted_roi"]:.2f}%</td>
+                <td>{s["weighted_pnl"]:.2f}</td>
+            </tr>
         """
 
     html += """
             </table>
+
         </div>
     """
 
     html += """
         <div class="card">
+
             <h2>🧠 Feature Combination Analytics min 10 trades</h2>
+
             <table>
+
                 <tr>
                     <th>Combination</th>
                     <th>Trades</th>
@@ -1659,21 +1689,24 @@ def analytics():
     """
 
     for s in data["top_feature_combos"]:
+
         html += f"""
-                <tr>
-                    <td>{s["name"]}</td>
-                    <td>{s["count"]}</td>
-                    <td>{s["wins"]}</td>
-                    <td>{s["losses"]}</td>
-                    <td>{s["winrate"]:.2f}%</td>
-                    <td>{s["weighted_roi"]:.2f}%</td>
-                    <td>{s["weighted_pnl"]:.2f}</td>
-                </tr>
+            <tr>
+                <td>{s["name"]}</td>
+                <td>{s["count"]}</td>
+                <td>{s["wins"]}</td>
+                <td>{s["losses"]}</td>
+                <td>{s["winrate"]:.2f}%</td>
+                <td>{s["weighted_roi"]:.2f}%</td>
+                <td>{s["weighted_pnl"]:.2f}</td>
+            </tr>
         """
 
     html += """
             </table>
+
         </div>
+
     </body>
     </html>
     """
