@@ -302,6 +302,19 @@ def reinforcement_bucket(count):
 
     return "10+"
 
+def cumulative_size_bucket(size):
+    size = float(size or 0)
+
+    if size < 500:
+        return "<500"
+
+    if size < 2000:
+        return "500-2000"
+
+    if size < 5000:
+        return "2000-5000"
+
+    return "5000+"
 
 def calculate_edge_score(outcome, price, usdc_size, btc_signal):
     score = 0
@@ -766,7 +779,8 @@ def get_category_stats(group_field):
             quality_signal,
             entry_timing,
             aggressiveness_score,
-            reinforcement_count
+            reinforcement_count,
+            cumulative_size
         FROM raw_trades
         WHERE status = 'CLOSED'
     """)
@@ -787,7 +801,8 @@ def get_category_stats(group_field):
         quality_signal,
         entry_timing,
         aggressiveness_score,
-        reinforcement_count
+        reinforcement_count,
+        cumulative_size
     ) in rows:
 
         if group_field == "outcome":
@@ -810,6 +825,9 @@ def get_category_stats(group_field):
 
         elif group_field == "reinforcement":
             key = reinforcement_bucket(reinforcement_count)
+
+        elif group_field == "cumulative_size":
+            key = cumulative_size_bucket(cumulative_size)
 
         else:
             key = "Other"
@@ -1029,7 +1047,8 @@ def get_advanced_analytics():
             roi,
             market_type,
             quality_signal,
-            reinforcement_count
+            reinforcement_count,
+            cumulative_size
         FROM raw_trades
         WHERE status = 'CLOSED'
         ORDER BY id ASC
@@ -1059,15 +1078,17 @@ def get_advanced_analytics():
             roi,
             market_type,
             quality_signal,
-            reinforcement_count
+            reinforcement_count,
+            cumulative_size
         ) = row
 
         bucket = price_bucket(price)
+        size_bucket = cumulative_size_bucket(cumulative_size)
         quality = "Quality" if quality_signal == 1 else "Excluded"
         clean_market_type = market_type or classify_market(title)
 
         strategy = f"{quality} | {clean_market_type} | {outcome} | {bucket}"
-        combo = f"{quality} | {clean_market_type} | {outcome} | {bucket} | Reinforcement {reinforcement_bucket(reinforcement_count)}"
+        combo = f"{quality} | {clean_market_type} | {outcome} | {bucket} | Reinforcement {reinforcement_bucket(reinforcement_count) | Size {size_bucket}") }"
 
         pnl = weighted_pnl_for_trade(result, usdc_size, roi)
 
@@ -1502,6 +1523,7 @@ def dashboard():
     html += render_category_table("🕒 Analyse Entry Timing", stats["by_timing"])
     html += render_category_table("🔥 Analyse Aggressiveness", stats["by_aggressiveness"])
     html += render_category_table("🔁 Analyse Reinforcement", stats["by_reinforcement"])
+html += render_category_table("💰 Cumulative Size Analytics", stats("cumulative_size"))
 
     html += """
     </body>
