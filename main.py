@@ -231,20 +231,31 @@ def classify_market(title):
 
     if "reach" in text:
         return "Reach"
-
     if "dip" in text:
         return "Dip"
-
     if "above" in text:
         return "Above"
-
     if "below" in text:
         return "Below"
-
     if "between" in text:
         return "Range"
 
     return "Other"
+
+
+def is_quality_signal(title, outcome):
+    market_type = classify_market(title)
+
+    if market_type == "Dip" and outcome == "No":
+        return False
+
+    if outcome == "Yes":
+        return True
+
+    if market_type in ["Range", "Reach", "Above"]:
+        return True
+
+    return False
 
 
 def price_bucket(price):
@@ -252,7 +263,6 @@ def price_bucket(price):
 
     if price < 0.70:
         return "0.50-0.70"
-
     if price < 0.90:
         return "0.70-0.90"
 
@@ -495,13 +505,12 @@ def get_category_stats(group_field):
     for title, outcome, price, usdc_size, result, roi in rows:
         if group_field == "outcome":
             key = outcome
-
         elif group_field == "price":
             key = price_bucket(price)
-
         elif group_field == "market":
             key = classify_market(title)
-
+        elif group_field == "quality":
+            key = "Quality" if is_quality_signal(title, outcome) else "Excluded"
         else:
             key = "Other"
 
@@ -682,7 +691,8 @@ def get_stats():
         "recent_paper": recent_paper,
         "by_outcome": get_category_stats("outcome"),
         "by_price": get_category_stats("price"),
-        "by_market": get_category_stats("market")
+        "by_market": get_category_stats("market"),
+        "by_quality": get_category_stats("quality")
     }
 
 
@@ -750,6 +760,9 @@ def whale_tracker_loop():
                     edge_score
                 )
 
+                market_type = classify_market(title)
+                quality = is_quality_signal(title, outcome)
+
                 lecture = (
                     "Whale évite fortement ce scénario"
                     if outcome == "No"
@@ -764,7 +777,9 @@ def whale_tracker_loop():
                     "count": 1,
                     "edge_score": edge_score,
                     "lecture": lecture,
-                    "paper_trade": paper_saved
+                    "paper_trade": paper_saved,
+                    "market_type": market_type,
+                    "quality": quality
                 }
 
                 latest_edge_signals.append(signal_data)
@@ -779,6 +794,12 @@ Marché :
 
 Outcome :
 {outcome}
+
+Market type :
+{market_type}
+
+Quality signal :
+{quality}
 
 Montant :
 {usdc_size:.2f} USDC
@@ -930,6 +951,7 @@ def dashboard():
         </div>
     """
 
+    html += render_category_table("✅ Analyse Quality Signals", stats["by_quality"])
     html += render_category_table("📊 Analyse YES vs NO", stats["by_outcome"])
     html += render_category_table("📊 Analyse par prix", stats["by_price"])
     html += render_category_table("📊 Analyse par type de marché", stats["by_market"])
@@ -948,6 +970,8 @@ def dashboard():
         <div class="card">
             <h3>{signal['title']}</h3>
             <p>Outcome : {signal['outcome']}</p>
+            <p>Market type : {signal['market_type']}</p>
+            <p>Quality Signal : {signal['quality']}</p>
             <p>Montant : {signal['total_usdc']:.2f} USDC</p>
             <p>Prix : {signal['avg_price']:.3f}</p>
             <p>EDGE SCORE : {signal['edge_score']}/10</p>
@@ -961,12 +985,16 @@ def dashboard():
     for trade in stats["recent_raw"]:
         date_detected, title, outcome, price, usdc_size, status, result, roi = trade
         result_class = "win" if result == "WIN" else "loss"
+        quality = is_quality_signal(title, outcome)
+        market_type = classify_market(title)
 
         html += f"""
         <div class="card">
             <h3>{title}</h3>
             <p>Date : {date_detected}</p>
             <p>Outcome : {outcome}</p>
+            <p>Market type : {market_type}</p>
+            <p>Quality Signal : {quality}</p>
             <p>Prix : {price}</p>
             <p>Montant whale : {usdc_size:.2f} USDC</p>
             <p>Status : {status}</p>
