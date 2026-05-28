@@ -20,6 +20,7 @@ MIN_USDC_SIZE = 25
 MIN_PRICE = 0.50
 PAPER_TRADE_SIZE = 1
 MIN_STRATEGY_TRADES = 20
+MIN_COMBO_TRADES = 10
 
 DB_PATH = "/data/paper_trades.db"
 
@@ -119,14 +120,7 @@ def send_telegram_message(message):
 
     try:
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-        requests.get(
-            url,
-            params={
-                "chat_id": CHAT_ID,
-                "text": message
-            },
-            timeout=10
-        )
+        requests.get(url, params={"chat_id": CHAT_ID, "text": message}, timeout=10)
 
     except Exception as e:
         print("Erreur Telegram :", e)
@@ -166,11 +160,7 @@ def get_wallet_activity(limit=50):
             "offset": 0
         }
 
-        response = requests.get(
-            url,
-            params=params,
-            timeout=20
-        )
+        response = requests.get(url, params=params, timeout=20)
 
         if response.status_code != 200:
             print("Erreur activité :", response.text)
@@ -206,12 +196,7 @@ def get_market_data(slug):
 # --------------------------
 
 def extract_winning_outcome(market):
-    for key in [
-        "winner",
-        "winningOutcome",
-        "outcome",
-        "resolvedOutcome"
-    ]:
+    for key in ["winner", "winningOutcome", "outcome", "resolvedOutcome"]:
         value = market.get(key)
 
         if value in ["Yes", "No"]:
@@ -221,17 +206,8 @@ def extract_winning_outcome(market):
     prices_raw = market.get("outcomePrices")
 
     try:
-        outcomes = (
-            json.loads(outcomes_raw)
-            if isinstance(outcomes_raw, str)
-            else outcomes_raw
-        )
-
-        prices = (
-            json.loads(prices_raw)
-            if isinstance(prices_raw, str)
-            else prices_raw
-        )
+        outcomes = json.loads(outcomes_raw) if isinstance(outcomes_raw, str) else outcomes_raw
+        prices = json.loads(prices_raw) if isinstance(prices_raw, str) else prices_raw
 
         if outcomes and prices:
             prices_float = [float(p) for p in prices]
@@ -332,19 +308,15 @@ def calculate_edge_score(outcome, price, usdc_size, btc_signal):
 
     if usdc_size > 1000:
         score += 3
-
     elif usdc_size > 500:
         score += 2
-
     elif usdc_size > 100:
         score += 1
 
     if price > 0.97:
         score += 3
-
     elif price > 0.93:
         score += 2
-
     elif price > 0.88:
         score += 1
 
@@ -428,10 +400,7 @@ def calculate_reinforcement_features(title, outcome):
         FROM raw_trades
         WHERE title = ?
         AND outcome = ?
-    """, (
-        title,
-        outcome
-    ))
+    """, (title, outcome))
 
     count, cumulative_size = cursor.fetchone()
 
@@ -450,10 +419,7 @@ def calculate_aggressiveness_score(title, outcome):
         WHERE title = ?
         AND outcome = ?
         AND datetime(date_detected) >= datetime('now', '-10 minutes')
-    """, (
-        title,
-        outcome
-    ))
+    """, (title, outcome))
 
     recent_count = cursor.fetchone()[0]
 
@@ -497,11 +463,7 @@ def backfill_clean_fields():
             SET market_type = ?,
                 quality_signal = ?
             WHERE id = ?
-        """, (
-            market_type,
-            quality_signal,
-            raw_id
-        ))
+        """, (market_type, quality_signal, raw_id))
 
     conn.commit()
     conn.close()
@@ -552,10 +514,7 @@ def save_raw_trade(activity, btc_price):
     time_before_expiry = calculate_time_before_expiry_minutes(slug)
     entry_timing = classify_entry_timing(time_before_expiry)
 
-    aggressiveness_score = calculate_aggressiveness_score(
-        title,
-        outcome
-    )
+    aggressiveness_score = calculate_aggressiveness_score(title, outcome)
 
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
@@ -874,11 +833,7 @@ def get_category_stats(group_field):
             groups[key]["losses"] += 1
 
         groups[key]["roi_sum"] += float(roi or 0)
-        groups[key]["weighted_pnl"] += weighted_pnl_for_trade(
-            result,
-            usdc_size,
-            roi
-        )
+        groups[key]["weighted_pnl"] += weighted_pnl_for_trade(result, usdc_size, roi)
         groups[key]["total_size"] += float(usdc_size or 0)
 
     final = []
@@ -888,23 +843,9 @@ def get_category_stats(group_field):
         wins = data["wins"]
         total_size = data["total_size"]
 
-        winrate = (
-            wins / count * 100
-            if count
-            else 0
-        )
-
-        avg_roi = (
-            data["roi_sum"] / count
-            if count
-            else 0
-        )
-
-        weighted_roi = (
-            data["weighted_pnl"] / total_size * 100
-            if total_size
-            else 0
-        )
+        winrate = wins / count * 100 if count else 0
+        avg_roi = data["roi_sum"] / count if count else 0
+        weighted_roi = data["weighted_pnl"] / total_size * 100 if total_size else 0
 
         final.append({
             "name": key,
@@ -918,11 +859,7 @@ def get_category_stats(group_field):
             "total_size": total_size
         })
 
-    return sorted(
-        final,
-        key=lambda x: x["count"],
-        reverse=True
-    )
+    return sorted(final, key=lambda x: x["count"], reverse=True)
 
 
 def get_stats():
@@ -948,17 +885,10 @@ def get_stats():
     """)
     raw_avg_roi = cursor.fetchone()[0]
 
-    raw_winrate = (
-        raw_wins / raw_closed * 100
-        if raw_closed
-        else 0
-    )
+    raw_winrate = raw_wins / raw_closed * 100 if raw_closed else 0
 
     cursor.execute("""
-        SELECT
-            result,
-            usdc_size,
-            roi
+        SELECT result, usdc_size, roi
         FROM raw_trades
         WHERE status = 'CLOSED'
     """)
@@ -970,16 +900,9 @@ def get_stats():
         for result, usdc_size, roi in closed_rows
     )
 
-    total_weight = sum(
-        float(usdc_size or 0)
-        for _, usdc_size, _ in closed_rows
-    )
+    total_weight = sum(float(usdc_size or 0) for _, usdc_size, _ in closed_rows)
 
-    weighted_roi = (
-        weighted_pnl / total_weight * 100
-        if total_weight > 0
-        else 0
-    )
+    weighted_roi = weighted_pnl / total_weight * 100 if total_weight > 0 else 0
 
     cursor.execute("""
         SELECT COALESCE(AVG(usdc_size), 0)
@@ -1017,11 +940,7 @@ def get_stats():
     """)
     paper_pnl = cursor.fetchone()[0]
 
-    paper_winrate = (
-        paper_wins / paper_closed * 100
-        if paper_closed
-        else 0
-    )
+    paper_winrate = paper_wins / paper_closed * 100 if paper_closed else 0
 
     cursor.execute("""
         SELECT
@@ -1109,7 +1028,8 @@ def get_advanced_analytics():
             result,
             roi,
             market_type,
-            quality_signal
+            quality_signal,
+            reinforcement_count
         FROM raw_trades
         WHERE status = 'CLOSED'
         ORDER BY id ASC
@@ -1127,21 +1047,29 @@ def get_advanced_analytics():
     excluded_pnl = 0
 
     strategies = {}
+    feature_combos = {}
 
     for i, row in enumerate(rows, start=1):
-        title, outcome, price, usdc_size, result, roi, market_type, quality_signal = row
+        (
+            title,
+            outcome,
+            price,
+            usdc_size,
+            result,
+            roi,
+            market_type,
+            quality_signal,
+            reinforcement_count
+        ) = row
 
         bucket = price_bucket(price)
         quality = "Quality" if quality_signal == 1 else "Excluded"
         clean_market_type = market_type or classify_market(title)
 
         strategy = f"{quality} | {clean_market_type} | {outcome} | {bucket}"
+        combo = f"{quality} | {clean_market_type} | {outcome} | {bucket} | Reinforcement {reinforcement_bucket(reinforcement_count)}"
 
-        pnl = weighted_pnl_for_trade(
-            result,
-            usdc_size,
-            roi
-        )
+        pnl = weighted_pnl_for_trade(result, usdc_size, roi)
 
         total_pnl += pnl
         total_curve.append((i, round(total_pnl, 2)))
@@ -1168,9 +1096,26 @@ def get_advanced_analytics():
 
         if result == "WIN":
             strategies[strategy]["wins"] += 1
-
         elif result == "LOSS":
             strategies[strategy]["losses"] += 1
+
+        if combo not in feature_combos:
+            feature_combos[combo] = {
+                "count": 0,
+                "wins": 0,
+                "losses": 0,
+                "weighted_pnl": 0,
+                "total_size": 0
+            }
+
+        feature_combos[combo]["count"] += 1
+        feature_combos[combo]["total_size"] += float(usdc_size or 0)
+        feature_combos[combo]["weighted_pnl"] += pnl
+
+        if result == "WIN":
+            feature_combos[combo]["wins"] += 1
+        elif result == "LOSS":
+            feature_combos[combo]["losses"] += 1
 
     top_strategies = []
 
@@ -1181,18 +1126,8 @@ def get_advanced_analytics():
             continue
 
         total_size = data["total_size"]
-
-        winrate = (
-            data["wins"] / count * 100
-            if count
-            else 0
-        )
-
-        weighted_roi = (
-            data["weighted_pnl"] / total_size * 100
-            if total_size
-            else 0
-        )
+        winrate = data["wins"] / count * 100 if count else 0
+        weighted_roi = data["weighted_pnl"] / total_size * 100 if total_size else 0
 
         top_strategies.append({
             "name": name,
@@ -1210,16 +1145,41 @@ def get_advanced_analytics():
         reverse=True
     )
 
+    top_feature_combos = []
+
+    for name, data in feature_combos.items():
+        count = data["count"]
+
+        if count < MIN_COMBO_TRADES:
+            continue
+
+        total_size = data["total_size"]
+        winrate = data["wins"] / count * 100 if count else 0
+        weighted_roi = data["weighted_pnl"] / total_size * 100 if total_size else 0
+
+        top_feature_combos.append({
+            "name": name,
+            "count": count,
+            "wins": data["wins"],
+            "losses": data["losses"],
+            "winrate": winrate,
+            "weighted_roi": weighted_roi,
+            "weighted_pnl": data["weighted_pnl"]
+        })
+
+    top_feature_combos = sorted(
+        top_feature_combos,
+        key=lambda x: x["weighted_roi"],
+        reverse=True
+    )
+
     def rolling_winrate(n):
         sample = rows[-n:]
 
         if not sample:
             return 0
 
-        wins = sum(
-            1 for r in sample
-            if r[4] == "WIN"
-        )
+        wins = sum(1 for r in sample if r[4] == "WIN")
 
         return wins / len(sample) * 100
 
@@ -1230,11 +1190,7 @@ def get_advanced_analytics():
         if s["weighted_roi"] > 0
     ])
 
-    best_roi = (
-        top_strategies[0]["weighted_roi"]
-        if top_strategies
-        else 0
-    )
+    best_roi = top_strategies[0]["weighted_roi"] if top_strategies else 0
 
     confidence_score = min(
         100,
@@ -1248,6 +1204,7 @@ def get_advanced_analytics():
 
     return {
         "top_strategies": top_strategies[:15],
+        "top_feature_combos": top_feature_combos[:20],
         "total_curve": total_curve[-50:],
         "quality_curve": quality_curve[-50:],
         "excluded_curve": excluded_curve[-50:],
@@ -1300,10 +1257,7 @@ def whale_tracker_loop():
                 tx_hash = activity.get("transactionHash")
                 text = title.lower()
 
-                is_btc = (
-                    "bitcoin" in text
-                    or "btc" in text
-                )
+                is_btc = "bitcoin" in text or "btc" in text
 
                 if not (
                     is_btc
@@ -1313,26 +1267,14 @@ def whale_tracker_loop():
                 ):
                     continue
 
-                is_new = save_raw_trade(
-                    activity,
-                    btc_price
-                )
+                is_new = save_raw_trade(activity, btc_price)
 
                 if not is_new:
                     continue
 
-                edge_score = calculate_edge_score(
-                    outcome,
-                    price,
-                    usdc_size,
-                    btc_signal
-                )
+                edge_score = calculate_edge_score(outcome, price, usdc_size, btc_signal)
 
-                paper_saved = save_paper_trade(
-                    activity,
-                    btc_price,
-                    edge_score
-                )
+                paper_saved = save_paper_trade(activity, btc_price, edge_score)
 
                 market_type = classify_market(title)
                 quality = is_quality_signal(title, outcome)
@@ -1356,9 +1298,7 @@ def whale_tracker_loop():
                     "quality": quality
                 }
 
-                latest_edge_signals.append(
-                    signal_data
-                )
+                latest_edge_signals.append(signal_data)
 
                 message = f"""
 🧠 RAW WHALE TRADE
@@ -1637,9 +1577,9 @@ def analytics():
     html += render_curve("❌ Excluded Cumulative PnL — last 50", data["excluded_curve"])
 
     html += render_category_table(
-    "🔁 Reinforcement Analytics",
-    get_category_stats("reinforcement")
-)
+        "🔁 Reinforcement Analytics",
+        get_category_stats("reinforcement")
+    )
 
     html += """
         <div class="card">
@@ -1657,6 +1597,39 @@ def analytics():
     """
 
     for s in data["top_strategies"]:
+        html += f"""
+                <tr>
+                    <td>{s["name"]}</td>
+                    <td>{s["count"]}</td>
+                    <td>{s["wins"]}</td>
+                    <td>{s["losses"]}</td>
+                    <td>{s["winrate"]:.2f}%</td>
+                    <td>{s["weighted_roi"]:.2f}%</td>
+                    <td>{s["weighted_pnl"]:.2f}</td>
+                </tr>
+        """
+
+    html += """
+            </table>
+        </div>
+    """
+
+    html += """
+        <div class="card">
+            <h2>🧠 Feature Combination Analytics min 10 trades</h2>
+            <table>
+                <tr>
+                    <th>Combination</th>
+                    <th>Trades</th>
+                    <th>Wins</th>
+                    <th>Losses</th>
+                    <th>Winrate</th>
+                    <th>Weighted ROI</th>
+                    <th>Weighted PnL</th>
+                </tr>
+    """
+
+    for s in data["top_feature_combos"]:
         html += f"""
                 <tr>
                     <td>{s["name"]}</td>
