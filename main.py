@@ -962,6 +962,28 @@ def get_probability_grade_stats():
 
 
 
+
+def get_validated_grade_stats():
+    all_grades = get_probability_grade_stats()
+    target_grades = ["A+", "A", "B"]
+
+    rows = []
+    for row in all_grades:
+        if row["name"] in target_grades:
+            validated = (
+                row["count"] >= 10
+                and row["weighted_roi"] > 0
+                and row["winrate"] >= 60
+            )
+
+            row_copy = dict(row)
+            row_copy["validated"] = validated
+            rows.append(row_copy)
+
+    return rows
+
+
+
 def get_stats():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
@@ -1114,7 +1136,8 @@ def get_stats():
         "by_aggressiveness": get_category_stats("aggressiveness"),
         "by_reinforcement": get_category_stats("reinforcement"),
         "by_cumulative_size": get_category_stats("cumulative_size"),
-        "by_probability_grade": get_probability_grade_stats()
+        "by_probability_grade": get_probability_grade_stats(),
+        "validated_grades": get_validated_grade_stats()
     }
 
 
@@ -1500,6 +1523,59 @@ def render_category_table(title, rows):
     return html
 
 
+
+def render_validated_grades_table(rows):
+    html = """
+    <div class="card">
+        <h2>✅ Validation A+ / A / B</h2>
+        <table border="1" cellpadding="6" cellspacing="0" style="width:100%; color:white; border-collapse:collapse;">
+            <tr>
+                <th>Grade</th>
+                <th>Trades fermés</th>
+                <th>Wins</th>
+                <th>Losses</th>
+                <th>Winrate</th>
+                <th>Weighted ROI</th>
+                <th>Weighted PnL</th>
+                <th>Validation</th>
+            </tr>
+    """
+
+    if not rows:
+        html += """
+            <tr>
+                <td colspan="8">Pas encore assez de trades A+ / A / B fermés.</td>
+            </tr>
+        """
+
+    for row in rows:
+        validation = "✅ VALIDÉ" if row.get("validated") else "⏳ À CONFIRMER"
+
+        html += f"""
+            <tr>
+                <td>{row['name']}</td>
+                <td>{row['count']}</td>
+                <td>{row['wins']}</td>
+                <td>{row['losses']}</td>
+                <td>{row['winrate']:.2f}%</td>
+                <td>{row['weighted_roi']:.2f}%</td>
+                <td>{row['weighted_pnl']:.2f}</td>
+                <td>{validation}</td>
+            </tr>
+        """
+
+    html += """
+        </table>
+        <p>
+            Critère validation : minimum 10 trades fermés, Weighted ROI positif, Winrate ≥ 60%.
+        </p>
+    </div>
+    """
+
+    return html
+
+
+
 def render_curve(title, curve):
     html = f"""
     <div class="card">
@@ -1614,6 +1690,7 @@ def dashboard():
     html += render_category_table("🔁 Analyse Reinforcement", stats["by_reinforcement"])
     html += render_category_table("💰 Cumulative Size Analytics", stats["by_cumulative_size"])
     html += render_category_table("🧠 Probability Grade Analytics", stats["by_probability_grade"])
+    html += render_validated_grades_table(stats["validated_grades"])
 
     html += """
     </body>
@@ -1687,6 +1764,7 @@ def analytics():
     html += render_category_table("🔁 Reinforcement Analytics", get_category_stats("reinforcement"))
     html += render_category_table("💰 Cumulative Size Analytics", get_category_stats("cumulative_size"))
     html += render_category_table("🧠 Probability Grade Analytics", get_probability_grade_stats())
+    html += render_validated_grades_table(get_validated_grade_stats())
 
     html += """
         <div class="card">
