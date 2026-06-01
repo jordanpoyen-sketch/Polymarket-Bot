@@ -2030,6 +2030,7 @@ def get_live_setup_ranking(limit=30):
         if key not in grouped:
             grouped[key] = {
                 "date": date_detected,
+                "latest_raw_id": raw_id,
                 "title": title,
                 "outcome": outcome,
                 "price": float(price or 0),
@@ -2083,6 +2084,7 @@ def get_live_setup_ranking(limit=30):
 
             if item["date"] < date_detected:
                 item["date"] = date_detected
+                item["latest_raw_id"] = raw_id
 
     live = list(grouped.values())
 
@@ -2284,6 +2286,8 @@ def html_header(title):
             <a href="/">Dashboard</a>
             <a href="/analytics">Analytics</a>
             <a href="/setups">Live Setups</a>
+            <a href="/ml">ML</a>
+            <a href="/ml-performance">ML Performance</a>
         </div>
     """
 
@@ -2967,6 +2971,327 @@ def features_from_live_setup(setup):
     ]
 
 
+
+def ensure_ml_predictions_table():
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS ml_predictions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            prediction_date TEXT,
+            raw_trade_id INTEGER UNIQUE,
+            title TEXT,
+            outcome TEXT,
+            market_type TEXT,
+            price REAL,
+            probability_score REAL,
+            live_score REAL,
+            expected_roi REAL,
+            kelly_fraction REAL,
+            historical_roi REAL,
+            historical_winrate REAL,
+            historical_count INTEGER,
+            stat_action TEXT,
+            ml_action TEXT,
+            ml_win_probability REAL,
+            ml_edge REAL,
+            ml_grade TEXT,
+            final_score REAL,
+            validation TEXT,
+            confidence TEXT,
+            status TEXT DEFAULT 'OPEN',
+            result TEXT,
+            actual_roi REAL,
+            resolved_at TEXT
+        )
+    """)
+
+    conn.commit()
+    conn.close()
+
+
+def save_ml_prediction(row):
+    ensure_ml_predictions_table()
+
+    raw_trade_id = row.get("latest_raw_id")
+
+    if not raw_trade_id:
+        return
+
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        INSERT OR REPLACE INTO ml_predictions (
+            prediction_date,
+            raw_trade_id,
+            title,
+            outcome,
+            market_type,
+            price,
+            probability_score,
+            live_score,
+            expected_roi,
+            kelly_fraction,
+            historical_roi,
+            historical_winrate,
+            historical_count,
+            stat_action,
+            ml_action,
+            ml_win_probability,
+            ml_edge,
+            ml_grade,
+            final_score,
+            validation,
+            confidence,
+            status,
+            result,
+            actual_roi,
+            resolved_at
+        )
+        VALUES (
+            COALESCE(
+                (SELECT prediction_date FROM ml_predictions WHERE raw_trade_id = ?),
+                ?
+            ),
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 
+            COALESCE(
+                (SELECT status FROM ml_predictions WHERE raw_trade_id = ?),
+                'OPEN'
+            ),
+            (SELECT result FROM ml_predictions WHERE raw_trade_id = ?),
+            (SELECT actual_roi FROM ml_predictions WHERE raw_trade_id = ?),
+            (SELECT resolved_at FROM ml_predictions WHERE raw_trade_id = ?)
+        )
+    """, (
+        raw_trade_id,
+        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        raw_trade_id,
+        row.get("title"),
+        row.get("outcome"),
+        row.get("market_type"),
+        float(row.get("price") or 0),
+        float(row.get("probability_score") or 0),
+        float(row.get("live_score") or 0),
+        float(row.get("expected_roi") or 0),
+        float(row.get("kelly_fraction") or 0),
+        float(row.get("historical_roi") or 0),
+        float(row.get("historical_winrate") or 0),
+        int(row.get("historical_count") or 0),
+        row.get("action"),
+        row.get("ml_action"),
+        float(row.get("ml_win_probability") or 0),
+        float(row.get("ml_edge") or 0),
+        row.get("ml_grade"),
+        float(row.get("final_score") or 0),
+        row.get("validation"),
+        row.get("confidence"),
+        raw_trade_id,
+        raw_trade_id,
+        raw_trade_id,
+        raw_trade_id
+    ))
+
+    conn.commit()
+    conn.close()
+
+
+def resolve_ml_predictions():
+    ensure_ml_predictions_table()
+
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT
+            p.id,
+            p.raw_trade_id,
+            r.result,
+            r.roi,
+            r.resolved_at
+        FROM ml_predictions p
+        JOIN raw_trades r ON r.id = p.raw_trade_id
+        WHERE p.status = 'OPEN'
+        AND r.status = 'CLOSED'
+        AND r.result IN ('WIN', 'LOSS')
+    """)
+
+    rows = cursor.fetchall()
+
+    for prediction_id, raw_trade_id, result, roi, resolved_at in rows:
+        cursor.execute("""
+            UPDATE ml_predictions
+            SET status = 'CLOSED',
+                result = ?,
+                actual_roi = ?,
+                resolved_at = ?
+            WHERE id = ?
+        """, (
+            result,
+            float(roi or 0),
+            resolved_at or datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            prediction_id
+        ))
+
+    conn.commit()
+    conn.close()
+
+
+def weighted_pnl_for_prediction(result, expected_roi, actual_roi, kelly_fraction):
+    # Evaluation normalized on 1 unit stake, not actual execution.
+    if result == "WIN":
+        return float(actual_roi or 0) / 100
+
+    if result == "LOSS":
+        return -1
+
+    return 0
+
+
+def get_ml_prediction_group_stats(group_field):
+    ensure_ml_predictions_table()
+    resolve_ml_predictions()
+
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT
+            ml_action,
+            stat_action,
+            ml_grade,
+            validation,
+            confidence,
+            result,
+            actual_roi,
+            expected_roi,
+            final_score,
+            ml_win_probability,
+            kelly_fraction
+        FROM ml_predictions
+        WHERE status = 'CLOSED'
+        AND result IN ('WIN', 'LOSS')
+    """)
+
+    rows = cursor.fetchall()
+    conn.close()
+
+    groups = {}
+
+    for (
+        ml_action,
+        stat_action,
+        ml_grade,
+        validation,
+        confidence,
+        result,
+        actual_roi,
+        expected_roi,
+        final_score,
+        ml_win_probability,
+        kelly_fraction
+    ) in rows:
+
+        if group_field == "ml_action":
+            key = ml_action or "Unknown"
+        elif group_field == "stat_action":
+            key = stat_action or "Unknown"
+        elif group_field == "ml_grade":
+            key = ml_grade or "Unknown"
+        elif group_field == "validation":
+            key = validation or "Unknown"
+        elif group_field == "confidence":
+            key = confidence or "Unknown"
+        else:
+            key = "All"
+
+        if key not in groups:
+            groups[key] = {
+                "count": 0,
+                "wins": 0,
+                "losses": 0,
+                "roi_sum": 0,
+                "pnl_sum": 0,
+                "expected_roi_sum": 0,
+                "final_score_sum": 0,
+                "ml_probability_sum": 0,
+                "kelly_sum": 0
+            }
+
+        groups[key]["count"] += 1
+
+        if result == "WIN":
+            groups[key]["wins"] += 1
+        elif result == "LOSS":
+            groups[key]["losses"] += 1
+
+        groups[key]["roi_sum"] += float(actual_roi or 0)
+        groups[key]["expected_roi_sum"] += float(expected_roi or 0)
+        groups[key]["final_score_sum"] += float(final_score or 0)
+        groups[key]["ml_probability_sum"] += float(ml_win_probability or 0)
+        groups[key]["kelly_sum"] += float(kelly_fraction or 0)
+        groups[key]["pnl_sum"] += weighted_pnl_for_prediction(result, expected_roi, actual_roi, kelly_fraction)
+
+    final = []
+
+    for key, data in groups.items():
+        count = data["count"]
+        wins = data["wins"]
+
+        final.append({
+            "name": key,
+            "count": count,
+            "wins": wins,
+            "losses": data["losses"],
+            "winrate": wins / count * 100 if count else 0,
+            "avg_roi": data["roi_sum"] / count if count else 0,
+            "expected_roi": data["expected_roi_sum"] / count if count else 0,
+            "avg_final_score": data["final_score_sum"] / count if count else 0,
+            "avg_ml_probability": data["ml_probability_sum"] / count if count else 0,
+            "avg_kelly": data["kelly_sum"] / count if count else 0,
+            "paper_pnl": data["pnl_sum"]
+        })
+
+    return sorted(final, key=lambda x: x["paper_pnl"], reverse=True)
+
+
+def get_recent_ml_predictions(limit=50):
+    ensure_ml_predictions_table()
+    resolve_ml_predictions()
+
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT
+            prediction_date,
+            title,
+            outcome,
+            ml_action,
+            stat_action,
+            final_score,
+            ml_win_probability,
+            expected_roi,
+            kelly_fraction,
+            validation,
+            confidence,
+            status,
+            result,
+            actual_roi,
+            resolved_at
+        FROM ml_predictions
+        ORDER BY id DESC
+        LIMIT ?
+    """, (limit,))
+
+    rows = cursor.fetchall()
+    conn.close()
+
+    return rows
+
+
+
 def run_xgboost_shadow_model():
     try:
         from xgboost import XGBClassifier
@@ -3113,6 +3438,9 @@ def run_xgboost_shadow_model():
         item["combined_score"] = combined_score
         item["final_score"] = final_score
         item["ml_action"] = ml_action
+
+        save_ml_prediction(item)
+
         ml_predictions.append(item)
 
     ml_predictions = sorted(
@@ -3154,6 +3482,9 @@ def ml_action_badge(action):
 def ml_dashboard():
     init_db()
     backfill_clean_fields()
+
+    ensure_ml_predictions_table()
+    resolve_ml_predictions()
 
     result = run_xgboost_shadow_model()
 
@@ -3291,6 +3622,166 @@ scikit-learn</pre>
                 Final Score = 35% Live Score V4 + 35% ML Win calibré + 15% Expected ROI + 15% Historical ROI.
                 ML Edge = ML Win % - Winrate historique du setup.
             </p>
+        </div>
+    """
+
+    html += html_footer()
+    return html
+
+
+
+def render_ml_prediction_stats_table(title, rows):
+    html = f"""
+    <div class="section">
+        <h2>{title}</h2>
+        <table>
+            <tr>
+                <th>Catégorie</th>
+                <th>Trades fermés</th>
+                <th>Wins</th>
+                <th>Losses</th>
+                <th>Winrate</th>
+                <th>Avg Actual ROI</th>
+                <th>Avg Expected ROI</th>
+                <th>Avg ML %</th>
+                <th>Avg Final Score</th>
+                <th>Avg Kelly</th>
+                <th>Paper PnL 1u</th>
+            </tr>
+    """
+
+    if not rows:
+        html += """
+            <tr>
+                <td colspan="11">Aucune prédiction ML fermée pour le moment.</td>
+            </tr>
+        """
+
+    for row in rows:
+        html += f"""
+            <tr>
+                <td>{row['name']}</td>
+                <td>{row['count']}</td>
+                <td>{row['wins']}</td>
+                <td>{row['losses']}</td>
+                <td>{row['winrate']:.2f}%</td>
+                <td class="{roi_class(row['avg_roi'])}">{row['avg_roi']:.2f}%</td>
+                <td class="{roi_class(row['expected_roi'])}">{row['expected_roi']:.2f}%</td>
+                <td>{row['avg_ml_probability']:.2f}%</td>
+                <td>{row['avg_final_score']:.2f}</td>
+                <td>{row['avg_kelly']:.2f}%</td>
+                <td class="{roi_class(row['paper_pnl'])}">{row['paper_pnl']:.2f}</td>
+            </tr>
+        """
+
+    html += """
+        </table>
+    </div>
+    """
+
+    return html
+
+
+@app.get("/ml-performance", response_class=HTMLResponse)
+def ml_performance_dashboard():
+    init_db()
+    backfill_clean_fields()
+    ensure_ml_predictions_table()
+    resolve_ml_predictions()
+
+    by_ml_action = get_ml_prediction_group_stats("ml_action")
+    by_stat_action = get_ml_prediction_group_stats("stat_action")
+    by_ml_grade = get_ml_prediction_group_stats("ml_grade")
+    by_validation = get_ml_prediction_group_stats("validation")
+    recent = get_recent_ml_predictions(50)
+
+    html = html_header("ML Performance")
+
+    html += """
+        <h1>📈 ML Performance Tracking</h1>
+        <div class="section">
+            <h2>Objectif</h2>
+            <p>Cette page mesure les prédictions ML en conditions réelles une fois les trades fermés.</p>
+            <p class="small">C'est le test décisif : ML CONFIRMED BUY doit battre ML WATCH et ML SKIP.</p>
+        </div>
+    """
+
+    html += render_ml_prediction_stats_table("🧠 Performance par ML Action", by_ml_action)
+    html += render_ml_prediction_stats_table("📊 Performance par Stat Action", by_stat_action)
+    html += render_ml_prediction_stats_table("🏷️ Performance par ML Grade", by_ml_grade)
+    html += render_ml_prediction_stats_table("✅ Performance par Validation", by_validation)
+
+    html += """
+        <div class="section">
+            <h2>🕒 Dernières prédictions ML</h2>
+            <table>
+                <tr>
+                    <th>Date prédiction</th>
+                    <th>Market</th>
+                    <th>Outcome</th>
+                    <th>ML Action</th>
+                    <th>Stat Action</th>
+                    <th>Final Score</th>
+                    <th>ML Win %</th>
+                    <th>Expected ROI</th>
+                    <th>Kelly</th>
+                    <th>Validation</th>
+                    <th>Confidence</th>
+                    <th>Status</th>
+                    <th>Result</th>
+                    <th>Actual ROI</th>
+                    <th>Resolved At</th>
+                </tr>
+    """
+
+    if not recent:
+        html += """
+                <tr>
+                    <td colspan="15">Aucune prédiction enregistrée pour le moment. Ouvre /ml pour générer les premières prédictions.</td>
+                </tr>
+        """
+
+    for row in recent:
+        (
+            prediction_date,
+            title,
+            outcome,
+            ml_action,
+            stat_action,
+            final_score,
+            ml_win_probability,
+            expected_roi,
+            kelly_fraction,
+            validation,
+            confidence,
+            status,
+            result,
+            actual_roi,
+            resolved_at
+        ) = row
+
+        html += f"""
+                <tr>
+                    <td>{prediction_date}</td>
+                    <td>{title}</td>
+                    <td>{outcome}</td>
+                    <td>{ml_action}</td>
+                    <td>{stat_action}</td>
+                    <td>{float(final_score or 0):.2f}</td>
+                    <td>{float(ml_win_probability or 0):.2f}%</td>
+                    <td class="{roi_class(expected_roi)}">{float(expected_roi or 0):.2f}%</td>
+                    <td>{float(kelly_fraction or 0):.2f}%</td>
+                    <td>{validation}</td>
+                    <td>{confidence}</td>
+                    <td>{status}</td>
+                    <td>{result or ''}</td>
+                    <td class="{roi_class(actual_roi)}">{'' if actual_roi is None else f'{float(actual_roi):.2f}%'}</td>
+                    <td>{resolved_at or ''}</td>
+                </tr>
+        """
+
+    html += """
+            </table>
         </div>
     """
 
