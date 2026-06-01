@@ -30,17 +30,8 @@ last_scan_time = "Aucun scan"
 
 def init_db():
     os.makedirs("/data", exist_ok=True)
-    conn = sqlite3.connect(
-	DB_PATH,
-	timeout=30,
-	check_same_thread=False
-)
-
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-
-    cursor.execute("PRAGMA journal_mode=WAL")
-    cursor.execute("PRAGMA synchronous=NORMAL")
-
 
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS raw_trades (
@@ -2442,6 +2433,296 @@ def render_closed_paper_trades_table(rows):
     return html
 
 
+
+# --------------------------
+# LOGICAL ARBITRAGE ENGINE
+# --------------------------
+
+def extract_btc_threshold(title):
+    if not title:
+        return None
+
+    import re
+    match = re.search(r"\$([0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)", title)
+
+    if not match:
+        return None
+
+    try:
+        return float(match.group(1).replace(",", ""))
+    except Exception:
+        return None
+
+
+def normalize_event_date_bucket(title):
+    if not title:
+        return "unknown"
+
+    import re
+
+    text = title.lower()
+
+    match = re.search(
+        r"(january|february|march|april|may|june|july|august|september|october|november|december)\s+([0-9]{1,2})",
+        text
+    )
+
+    if match:
+        return f"{match.group(1)}-{match.group(2)}"
+
+    if "in may" in text:
+        return "may"
+
+    if "in june" in text:
+        return "june"
+
+    return "unknown"
+
+
+def get_open_btc_markets_for_logical_arb():
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT
+            id,
+            date_detected,
+            title,
+            outcome,
+            price,
+            market_type,
+            quality_signal,
+            reinforcement_count,
+            cumulative_size,
+            probability_score,
+            trade_grade
+        FROM raw_trades
+        WHERE status = 'OPEN'
+        AND title LIKE '%Bitcoin%'
+        AND price IS NOT NULL
+        ORDER BY id DESC
+        LIMIT 1000
+    """)
+
+    rows = cursor.fetchall()
+    conn.close()
+
+    markets = []
+    seen = set()
+
+    for row in rows:
+        (
+            raw_id,
+            date_detected,
+            title,
+            outcome,
+            price,
+            market_type,
+            quality_signal,
+            reinforcement_count,
+            cumulative_size,
+            probability_score,
+            trade_grade
+        ) = row
+
+        clean_type = market_type or classify_market(title)
+        clean_price = float(price or 0)
+        threshold = extract_btc_threshold(title)
+
+        key = (title, outcome)
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+
+        markets.append({
+            "id": raw_id,
+            "date": date_detected,
+            "title": title,
+            "outcome": outcome,
+            "price": clean_price,
+            "market_type": clean_type,
+            "quality": bool(quality_signal),
+            "reinforcement": int(reinforcement_count or 1),
+            "cumulative_size": float(cumulative_size or 0),
+            "probability_score": float(probability_score or 0),
+            "trade_grade": trade_grade or "",
+            "date_bucket": normalize_event_date_bucket(title),
+            "threshold": threshold
+        })
+
+    return markets
+
+
+def logical_arb_score(edge, price, quality, reinforcement, cumulative_size):
+    edge = float(edge or 0)
+    price = float(price or 0)
+    reinforcement = int(reinforcement or 1)
+    cumulative_size = float(cumulative_size or 0)
+
+    edge_component = min(100, edge * 1200)
+
+    if 0.50 <= price <= 0.85:
+        price_component = 100
+    elif 0.85 < price <= 0.93:
+        price_component = 70
+    elif 0.93 < price <= 0.98:
+        price_component = 40
+    else:
+        price_component = 25
+
+    quality_component = 100 if quality else 30
+
+    if reinforcement >= 20:
+        reinforcement_component = 100
+    elif reinforcement >= 10:
+        reinforcement_component = 80
+    elif reinforcement >= 4:
+        reinforcement_component = 55
+    else:
+        reinforcement_component = 25
+
+    if cumulative_size >= 20000:
+        size_component = 100
+    elif cumulative_size >= 5000:
+        size_component = 80
+    elif cumulative_size >= 1000:
+        size_component = 50
+    else:
+        size_component = 25
+
+    score = (
+        0.40 * edge_component
+        + 0.20 * price_component
+        + 0.15 * quality_component
+        + 0.15 * reinforcement_component
+        + 0.10 * size_component
+    )
+
+    return max(0, min(100, score))
+
+
+def get_logical_arbitrage_opportunities():
+    markets = get_open_btc_markets_for_logical_arb()
+    opportunities = []
+
+    above_yes = [
+        m for m in markets
+        if m["market_type"] == "Above"
+        and m["outcome"] == "Yes"
+        and m["threshold"] is not None
+    ]
+
+    for low in above_yes:
+        for high in above_yes:
+            if low["title"] == high["title"]:
+                continue
+
+            if low["date_bucket"] != high["date_bucket"]:
+                continue
+
+            if low["threshold"] >= high["threshold"]:
+                continue
+
+            logical_edge = high["price"] - low["price"]
+
+            if logical_edge > 0.005:
+                score = logical_arb_score(
+                    logical_edge,
+                    low["price"],
+                    low["quality"],
+                    low["reinforcement"],
+                    low["cumulative_size"]
+                )
+
+                opportunities.append({
+                    "type": "Above inconsistency",
+                    "rule": "BTC > seuil bas doit coûter au moins autant que BTC > seuil haut",
+                    "market_buy": low,
+                    "market_compare": high,
+                    "edge": logical_edge,
+                    "score": score,
+                    "action": "BUY YES",
+                    "outcome": "Yes",
+                    "reason": "Le seuil le plus bas semble sous-évalué."
+                })
+
+    dip_yes = [
+        m for m in markets
+        if m["market_type"] == "Dip"
+        and m["outcome"] == "Yes"
+        and m["threshold"] is not None
+    ]
+
+    for higher in dip_yes:
+        for lower in dip_yes:
+            if higher["title"] == lower["title"]:
+                continue
+
+            if higher["date_bucket"] != lower["date_bucket"]:
+                continue
+
+            if higher["threshold"] <= lower["threshold"]:
+                continue
+
+            logical_edge = lower["price"] - higher["price"]
+
+            if logical_edge > 0.005:
+                score = logical_arb_score(
+                    logical_edge,
+                    higher["price"],
+                    higher["quality"],
+                    higher["reinforcement"],
+                    higher["cumulative_size"]
+                )
+
+                opportunities.append({
+                    "type": "Dip inconsistency",
+                    "rule": "Dip vers seuil haut doit coûter au moins autant que dip vers seuil bas",
+                    "market_buy": higher,
+                    "market_compare": lower,
+                    "edge": logical_edge,
+                    "score": score,
+                    "action": "BUY YES",
+                    "outcome": "Yes",
+                    "reason": "Le seuil de dip le plus haut semble sous-évalué."
+                })
+
+    unique = {}
+
+    for opp in opportunities:
+        key = (
+            opp["type"],
+            opp["market_buy"]["title"],
+            opp["market_compare"]["title"],
+            opp["action"]
+        )
+
+        if key not in unique or opp["score"] > unique[key]["score"]:
+            unique[key] = opp
+
+    opportunities = list(unique.values())
+
+    opportunities = sorted(
+        opportunities,
+        key=lambda x: (x["score"], x["edge"]),
+        reverse=True
+    )
+
+    return opportunities[:100]
+
+
+def logical_arb_action_label(score):
+    if score >= 80:
+        return "🟢 ARB BUY"
+
+    if score >= 60:
+        return "🟡 ARB WATCH"
+
+    return "⚪ WEAK"
+
+
 # --------------------------
 # UI HELPERS
 # --------------------------
@@ -2559,6 +2840,7 @@ def html_header(title):
             <a href="/ml">ML</a>
             <a href="/ml-performance">ML Performance</a>
             <a href="/paper">Paper Trades</a>
+            <a href="/logical-arb">Logical Arb</a>
         </div>
     """
 
@@ -4067,6 +4349,108 @@ def paper_trades_dashboard():
     html += render_paper_engine_card()
     html += render_open_paper_trades_table(open_rows)
     html += render_closed_paper_trades_table(closed_rows)
+
+    html += html_footer()
+    return html
+
+
+
+@app.get("/logical-arb", response_class=HTMLResponse)
+def logical_arb_dashboard():
+    init_db()
+    backfill_clean_fields()
+
+    opportunities = get_logical_arbitrage_opportunities()
+
+    html = html_header("Logical Arbitrage")
+
+    html += """
+        <h1>🧩 Logical Arbitrage</h1>
+        <div class="section">
+            <h2>Objectif</h2>
+            <p>Détecter les incohérences logiques entre marchés Bitcoin liés.</p>
+            <p class="small">
+                Exemple : BTC > 78k ne devrait jamais être plus cher que BTC > 76k sur la même période.
+                Si c'est le cas, le bot signale une anomalie.
+            </p>
+        </div>
+    """
+
+    best_score = "0"
+    best_edge = "0%"
+
+    if opportunities:
+        best_score = f"{opportunities[0]['score']:.1f}"
+        best_edge = f"{opportunities[0]['edge'] * 100:.2f}%"
+
+    html += f"""
+        <div class="grid">
+            {render_kpi("Opportunités détectées", len(opportunities))}
+            {render_kpi("Best Logical Score", best_score)}
+            {render_kpi("Best Logical Edge", best_edge)}
+        </div>
+    """
+
+    html += """
+        <div class="section">
+            <h2>🔥 Logical Arbitrage Opportunities</h2>
+            <table>
+                <tr>
+                    <th>Rank</th>
+                    <th>Action</th>
+                    <th>Score</th>
+                    <th>Logical Edge</th>
+                    <th>Type</th>
+                    <th>Market à acheter</th>
+                    <th>Outcome</th>
+                    <th>Prix</th>
+                    <th>Marché comparé</th>
+                    <th>Prix comparé</th>
+                    <th>Règle</th>
+                    <th>Quality</th>
+                    <th>Reinf.</th>
+                    <th>Cum Size</th>
+                </tr>
+    """
+
+    if not opportunities:
+        html += """
+                <tr>
+                    <td colspan="14">Aucune incohérence logique détectée actuellement.</td>
+                </tr>
+        """
+
+    for idx, opp in enumerate(opportunities, start=1):
+        buy = opp["market_buy"]
+        compare = opp["market_compare"]
+        quality = "✅" if buy["quality"] else "❌"
+
+        html += f"""
+                <tr>
+                    <td>{idx}</td>
+                    <td><b>{logical_arb_action_label(opp['score'])}</b><br><span class="small">{opp['action']}</span></td>
+                    <td><b>{opp['score']:.1f}</b></td>
+                    <td class="{roi_class(opp['edge'])}"><b>{opp['edge'] * 100:.2f}%</b></td>
+                    <td>{opp['type']}</td>
+                    <td>{buy['title']}<br><span class="small">{opp['reason']}</span></td>
+                    <td>{opp['outcome']}</td>
+                    <td>{buy['price']:.3f}</td>
+                    <td>{compare['title']}</td>
+                    <td>{compare['price']:.3f}</td>
+                    <td>{opp['rule']}</td>
+                    <td>{quality}</td>
+                    <td>{buy['reinforcement']}</td>
+                    <td>{buy['cumulative_size']:.2f}</td>
+                </tr>
+        """
+
+    html += """
+            </table>
+            <p class="small">
+                À utiliser comme signal supplémentaire. L'arbitrage logique ne doit pas remplacer BUY / ML CONFIRMED BUY / VALIDATED / HIGH.
+            </p>
+        </div>
+    """
 
     html += html_footer()
     return html
