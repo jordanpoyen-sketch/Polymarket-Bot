@@ -1659,14 +1659,78 @@ def get_setup_historical_stats(market_type, outcome, price, quality_signal, rein
     }
 
 
-def calculate_live_setup_score(probability_score, quality_signal, reinforcement_count, cumulative_size, aggressiveness_score, historical_roi, historical_count, validation_label):
+
+def calculate_price_risk(price, outcome):
+    price = float(price or 0)
+
+    if price <= 0:
+        return {"score": 0, "label": "UNKNOWN", "expected_payout_roi": 0}
+
+    expected_payout_roi = ((1 - price) / price) * 100
+
+    if price >= 0.95:
+        return {"score": 35, "label": "LOW UPSIDE", "expected_payout_roi": expected_payout_roi}
+    if price >= 0.85:
+        return {"score": 60, "label": "CONTROLLED", "expected_payout_roi": expected_payout_roi}
+    if price >= 0.70:
+        return {"score": 80, "label": "BALANCED", "expected_payout_roi": expected_payout_roi}
+    if price >= 0.50:
+        return {"score": 95, "label": "HIGH UPSIDE", "expected_payout_roi": expected_payout_roi}
+
+    return {"score": 55, "label": "SPECULATIVE", "expected_payout_roi": expected_payout_roi}
+
+
+def confidence_level(sample_size, historical_roi, winrate):
+    sample_size = int(sample_size or 0)
+    historical_roi = float(historical_roi or 0)
+    winrate = float(winrate or 0)
+
+    if sample_size >= 100 and historical_roi > 5 and winrate >= 75:
+        return "🟢 HIGH"
+    if sample_size >= 50 and historical_roi > 0 and winrate >= 65:
+        return "🟡 MEDIUM"
+    if sample_size >= 20 and historical_roi > 0:
+        return "🟠 LOW"
+
+    return "🔴 WEAK"
+
+
+def estimate_expected_roi(historical_roi, probability_score, price, validation_label):
+    historical_roi = float(historical_roi or 0)
+    probability_score = float(probability_score or 0)
+    price = float(price or 0)
+
+    payout_roi = ((1 - price) / price) * 100 if price > 0 else 0
+    probability_edge = (probability_score - 50) / 50
+    probability_roi = payout_roi * probability_edge
+
+    base = (0.70 * historical_roi) + (0.30 * probability_roi)
+
+    if validation_label == "VALIDATED":
+        base *= 1.10
+    elif validation_label == "PROMISING":
+        base *= 1.00
+    elif validation_label == "UNPROVEN":
+        base *= 0.70
+    elif validation_label == "NO HISTORY":
+        base *= 0.50
+    elif validation_label == "AVOID":
+        base *= 0.20
+
+    return base
+
+
+
+def calculate_live_setup_score(probability_score, quality_signal, reinforcement_count, cumulative_size, aggressiveness_score, historical_roi, historical_count, validation_label, price, expected_roi):
     probability_score = float(probability_score or 0)
     reinforcement_count = int(reinforcement_count or 1)
     cumulative_size = float(cumulative_size or 0)
     aggressiveness_score = int(aggressiveness_score or 1)
     historical_roi = float(historical_roi or 0)
     historical_count = int(historical_count or 0)
+    expected_roi = float(expected_roi or 0)
 
+    price_info = calculate_price_risk(price, None)
     quality_component = 100 if quality_signal else 0
 
     if reinforcement_count >= 50:
@@ -1706,39 +1770,54 @@ def calculate_live_setup_score(probability_score, quality_signal, reinforcement_
     elif historical_roi > 0:
         historical_component = 55
     elif historical_roi == 0:
-        historical_component = 40
+        historical_component = 35
     else:
         historical_component = 0
 
-    sample_bonus = 0
-    if historical_count >= 100:
-        sample_bonus = 5
+    if expected_roi >= 25:
+        expected_roi_component = 100
+    elif expected_roi >= 15:
+        expected_roi_component = 85
+    elif expected_roi >= 8:
+        expected_roi_component = 70
+    elif expected_roi > 0:
+        expected_roi_component = 55
+    else:
+        expected_roi_component = 0
+
+    if historical_count >= 300:
+        sample_component = 100
+    elif historical_count >= 100:
+        sample_component = 85
     elif historical_count >= 50:
-        sample_bonus = 3
+        sample_component = 70
     elif historical_count >= 20:
-        sample_bonus = 1
+        sample_component = 45
+    else:
+        sample_component = 15
 
     validation_bonus = {
-        "VALIDATED": 8,
-        "PROMISING": 3,
-        "UNPROVEN": -3,
-        "NO HISTORY": -5,
-        "AVOID": -20
+        "VALIDATED": 4,
+        "PROMISING": 1,
+        "UNPROVEN": -5,
+        "NO HISTORY": -8,
+        "AVOID": -25
     }.get(validation_label, 0)
 
     live_score = (
-        0.30 * probability_score
-        + 0.20 * quality_component
-        + 0.18 * reinforcement_component
-        + 0.12 * size_component
-        + 0.10 * aggressiveness_component
-        + 0.10 * historical_component
-        + sample_bonus
+        0.18 * probability_score
+        + 0.14 * quality_component
+        + 0.14 * reinforcement_component
+        + 0.10 * size_component
+        + 0.08 * aggressiveness_component
+        + 0.16 * historical_component
+        + 0.12 * expected_roi_component
+        + 0.05 * price_info["score"]
+        + 0.03 * sample_component
         + validation_bonus
     )
 
     return max(0, min(100, live_score))
-
 
 def get_live_setup_ranking(limit=30):
     conn = sqlite3.connect(DB_PATH)
@@ -1812,6 +1891,20 @@ def get_live_setup_ranking(limit=30):
             aggressiveness_score
         )
 
+        expected_roi = estimate_expected_roi(
+            historical["weighted_roi"],
+            probability_score,
+            price,
+            historical["label"]
+        )
+
+        price_info = calculate_price_risk(price, outcome)
+        confidence = confidence_level(
+            historical["count"],
+            historical["weighted_roi"],
+            historical["winrate"]
+        )
+
         live_score = calculate_live_setup_score(
             probability_score,
             quality_signal,
@@ -1820,7 +1913,9 @@ def get_live_setup_ranking(limit=30):
             aggressiveness_score,
             historical["weighted_roi"],
             historical["count"],
-            historical["label"]
+            historical["label"],
+            price,
+            expected_roi
         )
 
         if key not in grouped:
@@ -1847,6 +1942,10 @@ def get_live_setup_ranking(limit=30):
                 "historical_roi": historical["weighted_roi"],
                 "historical_pnl": historical["weighted_pnl"],
                 "validation": historical["label"],
+                "expected_roi": expected_roi,
+                "price_risk": price_info["label"],
+                "payout_roi": price_info["expected_payout_roi"],
+                "confidence": confidence,
                 "live_score": live_score
             }
         else:
@@ -1861,7 +1960,13 @@ def get_live_setup_ranking(limit=30):
             item["cumulative_size"] = max(item["cumulative_size"], float(cumulative_size or 0))
             item["aggressiveness"] = max(item["aggressiveness"], int(aggressiveness_score or 1))
             item["probability_score"] = max(item["probability_score"], float(probability_score or 0))
-            item["live_score"] = max(item["live_score"], live_score)
+
+            if live_score > item["live_score"]:
+                item["live_score"] = live_score
+                item["expected_roi"] = expected_roi
+                item["price_risk"] = price_info["label"]
+                item["payout_roi"] = price_info["expected_payout_roi"]
+                item["confidence"] = confidence
 
             if item["date"] < date_detected:
                 item["date"] = date_detected
@@ -1880,6 +1985,7 @@ def get_live_setup_ranking(limit=30):
         live,
         key=lambda x: (
             x["live_score"],
+            x["expected_roi"],
             priority.get(x["validation"], 0),
             x["historical_roi"],
             x["cumulative_size"]
@@ -2230,7 +2336,9 @@ def render_decision_cards(cards):
             <b>{best_setup['trade_grade']} — {best_setup['title']}</b><br>
             Outcome : {best_setup['outcome']}<br>
             Live Score : {best_setup['live_score']:.1f}/100<br>
+            Expected ROI : {best_setup['expected_roi']:.2f}%<br>
             Historical ROI : {best_setup['historical_roi']:.2f}%<br>
+            Confidence : {best_setup['confidence']}<br>
             Validation : {validation_badge(best_setup['validation'])}
         """
 
@@ -2273,20 +2381,23 @@ def render_decision_cards(cards):
 def render_live_setups_table(rows):
     html = """
     <div class="section">
-        <h2>🔥 Top Live Setups V2</h2>
+        <h2>🔥 Top Live Setups V3</h2>
         <p class="small">
-            1 ligne = 1 marché/outcome. Le classement utilise : Probability Score, Quality, reinforcement, cumulative size,
-            aggressiveness et ROI historique du setup.
+            1 ligne = 1 marché/outcome. Classement V3 : score non saturé, Expected ROI, Price Risk,
+            Confidence Level, ROI historique et validation statistique.
         </p>
         <table>
             <tr>
                 <th>Rank</th>
                 <th>Live Score</th>
+                <th>Expected ROI</th>
+                <th>Confidence</th>
                 <th>Validation</th>
                 <th>Grade</th>
                 <th>Market</th>
                 <th>Outcome</th>
                 <th>Prix</th>
+                <th>Price Risk</th>
                 <th>Type</th>
                 <th>Quality</th>
                 <th>Reinf.</th>
@@ -2301,7 +2412,7 @@ def render_live_setups_table(rows):
     if not rows:
         html += """
             <tr>
-                <td colspan="15">Aucun trade ouvert actuellement.</td>
+                <td colspan="18">Aucun trade ouvert actuellement.</td>
             </tr>
         """
 
@@ -2316,11 +2427,14 @@ def render_live_setups_table(rows):
             <tr>
                 <td>{idx}</td>
                 <td><b>{row['live_score']:.1f}</b></td>
+                <td class="{roi_class(row['expected_roi'])}"><b>{row['expected_roi']:.2f}%</b></td>
+                <td>{row['confidence']}</td>
                 <td>{validation_badge(row['validation'])}</td>
                 <td><b>{row['trade_grade']}</b></td>
                 <td>{row['title']}<br><span class="small">Signals visibles : {row['signals_visible']} | Dernier : {row['date']}</span></td>
                 <td>{row['outcome']}</td>
                 <td>{price_display}</td>
+                <td>{row['price_risk']}<br><span class="small">Payout ROI : {row['payout_roi']:.2f}%</span></td>
                 <td>{row['market_type']}</td>
                 <td>{quality}</td>
                 <td>{row['reinforcement']}</td>
