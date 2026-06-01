@@ -3091,6 +3091,7 @@ def save_ml_prediction(row):
         raw_trade_id,
         raw_trade_id,
         raw_trade_id
+	"OPEN"
     ))
 
     conn.commit()
