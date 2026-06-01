@@ -2763,6 +2763,276 @@ def logical_arb_action_label(score):
     return "⚪ WEAK"
 
 
+
+# --------------------------
+# RESOLUTION SNIPER ENGINE
+# --------------------------
+
+def get_market_end_datetime(slug):
+    market = get_market_data(slug)
+
+    if not market:
+        return None
+
+    end_date = market.get("endDateIso") or market.get("endDate") or market.get("umaEndDate")
+    return parse_iso_datetime(end_date)
+
+
+def minutes_until_market_expiry(slug):
+    end_dt = get_market_end_datetime(slug)
+
+    if not end_dt:
+        return None
+
+    now = datetime.now(timezone.utc)
+
+    if end_dt.tzinfo is None:
+        end_dt = end_dt.replace(tzinfo=timezone.utc)
+
+    diff = end_dt - now
+    return round(diff.total_seconds() / 60, 2)
+
+
+def classify_sniper_action(score):
+    if score >= 85:
+        return "🟢 SNIPER BUY"
+    if score >= 70:
+        return "🟡 WATCH"
+    return "⚪ SKIP"
+
+
+def calculate_sniper_distance(market_type, outcome, btc_price, threshold):
+    if not threshold or threshold <= 0 or not btc_price:
+        return None, False
+
+    btc_price = float(btc_price)
+    threshold = float(threshold)
+
+    distance_pct = abs(btc_price - threshold) / threshold * 100
+
+    is_favorable = False
+
+    if market_type == "Above":
+        if outcome == "Yes" and btc_price > threshold:
+            is_favorable = True
+        elif outcome == "No" and btc_price < threshold:
+            is_favorable = True
+
+    elif market_type == "Dip":
+        # Dip YES is favorable only if BTC already touched/confirmed below threshold.
+        # With live price only, we treat current below threshold as favorable.
+        if outcome == "Yes" and btc_price <= threshold:
+            is_favorable = True
+        elif outcome == "No" and btc_price > threshold:
+            is_favorable = True
+
+    elif market_type == "Reach":
+        if outcome == "Yes" and btc_price >= threshold:
+            is_favorable = True
+        elif outcome == "No" and btc_price < threshold:
+            is_favorable = True
+
+    return distance_pct, is_favorable
+
+
+def calculate_sniper_score(distance_pct, minutes_left, live_price, quality, probability_score):
+    if distance_pct is None or minutes_left is None:
+        return 0
+
+    distance_pct = float(distance_pct)
+    minutes_left = float(minutes_left)
+    live_price = float(live_price or 0)
+    probability_score = float(probability_score or 0)
+
+    if distance_pct >= 3:
+        distance_component = 100
+    elif distance_pct >= 2:
+        distance_component = 85
+    elif distance_pct >= 1:
+        distance_component = 65
+    elif distance_pct >= 0.5:
+        distance_component = 35
+    else:
+        distance_component = 10
+
+    if minutes_left <= 10:
+        time_component = 100
+    elif minutes_left <= 30:
+        time_component = 85
+    elif minutes_left <= 60:
+        time_component = 65
+    else:
+        time_component = 0
+
+    if 0.50 <= live_price <= 0.90:
+        price_component = 100
+    elif 0.90 < live_price <= 0.95:
+        price_component = 75
+    elif 0.95 < live_price <= 0.97:
+        price_component = 50
+    else:
+        price_component = 15
+
+    quality_component = 100 if quality else 40
+    ml_component = min(100, max(0, probability_score))
+
+    score = (
+        0.40 * distance_component
+        + 0.30 * time_component
+        + 0.20 * price_component
+        + 0.05 * quality_component
+        + 0.05 * ml_component
+    )
+
+    return max(0, min(100, score))
+
+
+def get_resolution_sniper_opportunities():
+    btc_price = get_btc_price()
+
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT
+            id,
+            date_detected,
+            title,
+            slug,
+            outcome,
+            price,
+            market_type,
+            quality_signal,
+            reinforcement_count,
+            cumulative_size,
+            probability_score,
+            trade_grade
+        FROM raw_trades
+        WHERE status = 'OPEN'
+        AND title LIKE '%Bitcoin%'
+        AND price IS NOT NULL
+        ORDER BY id DESC
+        LIMIT 1000
+    """)
+
+    rows = cursor.fetchall()
+    conn.close()
+
+    opportunities = []
+    seen = set()
+
+    for row in rows:
+        (
+            raw_id,
+            date_detected,
+            title,
+            slug,
+            outcome,
+            recorded_price,
+            market_type,
+            quality_signal,
+            reinforcement_count,
+            cumulative_size,
+            probability_score,
+            trade_grade
+        ) = row
+
+        key = (title, outcome)
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+
+        clean_type = market_type or classify_market(title)
+
+        if clean_type not in ["Above", "Dip", "Reach"]:
+            continue
+
+        threshold = extract_btc_threshold(title)
+
+        if not threshold:
+            continue
+
+        minutes_left = minutes_until_market_expiry(slug)
+
+        if minutes_left is None:
+            continue
+
+        if minutes_left <= 0 or minutes_left > 60:
+            continue
+
+        live_price = get_live_outcome_price(slug, outcome)
+
+        if live_price is None:
+            live_price = float(recorded_price or 0)
+            live_price_used = False
+        else:
+            live_price_used = True
+
+        if live_price >= 0.97:
+            continue
+
+        distance_pct, is_favorable = calculate_sniper_distance(
+            clean_type,
+            outcome,
+            btc_price,
+            threshold
+        )
+
+        if distance_pct is None:
+            continue
+
+        if distance_pct < 1:
+            continue
+
+        if not is_favorable:
+            continue
+
+        score = calculate_sniper_score(
+            distance_pct,
+            minutes_left,
+            live_price,
+            bool(quality_signal),
+            probability_score
+        )
+
+        opportunities.append({
+            "id": raw_id,
+            "date": date_detected,
+            "title": title,
+            "slug": slug,
+            "outcome": outcome,
+            "market_type": clean_type,
+            "threshold": threshold,
+            "btc_price": btc_price,
+            "distance_pct": distance_pct,
+            "minutes_left": minutes_left,
+            "live_price": float(live_price or 0),
+            "live_price_used": live_price_used,
+            "quality": bool(quality_signal),
+            "reinforcement": int(reinforcement_count or 1),
+            "cumulative_size": float(cumulative_size or 0),
+            "probability_score": float(probability_score or 0),
+            "trade_grade": trade_grade or "",
+            "score": score,
+            "action": classify_sniper_action(score)
+        })
+
+    opportunities = sorted(
+        opportunities,
+        key=lambda x: (
+            x["action"] == "🟢 SNIPER BUY",
+            x["score"],
+            x["distance_pct"],
+            -x["minutes_left"]
+        ),
+        reverse=True
+    )
+
+    return opportunities[:100]
+
+
 # --------------------------
 # UI HELPERS
 # --------------------------
@@ -2881,6 +3151,7 @@ def html_header(title):
             <a href="/ml-performance">ML Performance</a>
             <a href="/paper">Paper Trades</a>
             <a href="/logical-arb">Logical Arb</a>
+            <a href="/resolution-sniper">Resolution Sniper</a>
         </div>
     """
 
@@ -4489,6 +4760,114 @@ def logical_arb_dashboard():
             </table>
             <p class="small">
                 À utiliser comme signal supplémentaire. L'arbitrage logique ne doit pas remplacer BUY / ML CONFIRMED BUY / VALIDATED / HIGH.
+            </p>
+        </div>
+    """
+
+    html += html_footer()
+    return html
+
+
+
+@app.get("/resolution-sniper", response_class=HTMLResponse)
+def resolution_sniper_dashboard():
+    init_db()
+    backfill_clean_fields()
+
+    opportunities = get_resolution_sniper_opportunities()
+
+    html = html_header("Resolution Sniper")
+
+    best_score = "0"
+    best_distance = "0%"
+    best_time = "-"
+
+    if opportunities:
+        best_score = f"{opportunities[0]['score']:.1f}"
+        best_distance = f"{opportunities[0]['distance_pct']:.2f}%"
+        best_time = f"{opportunities[0]['minutes_left']:.1f} min"
+
+    html += """
+        <h1>🎯 Resolution Sniper</h1>
+        <div class="section">
+            <h2>Objectif</h2>
+            <p>Détecter les marchés BTC proches de l'expiration où le résultat semble presque verrouillé mais le prix n'est pas encore à 0.99.</p>
+            <p class="small">
+                Filtres V1 : BTC uniquement, expiration &lt; 60 min, distance au seuil &gt; 1%, prix live &lt; 0.97.
+            </p>
+        </div>
+    """
+
+    html += f"""
+        <div class="grid">
+            {render_kpi("Opportunités détectées", len(opportunities))}
+            {render_kpi("Best Sniper Score", best_score)}
+            {render_kpi("Best Distance", best_distance)}
+            {render_kpi("Time Left", best_time)}
+        </div>
+    """
+
+    html += """
+        <div class="section">
+            <h2>🔥 Resolution Sniper Opportunities</h2>
+            <table>
+                <tr>
+                    <th>Rank</th>
+                    <th>Action</th>
+                    <th>Score</th>
+                    <th>Market</th>
+                    <th>Outcome</th>
+                    <th>Prix</th>
+                    <th>BTC Live</th>
+                    <th>Seuil</th>
+                    <th>Distance</th>
+                    <th>Temps restant</th>
+                    <th>Type</th>
+                    <th>Quality</th>
+                    <th>Grade</th>
+                    <th>Prob Score</th>
+                    <th>Reinf.</th>
+                    <th>Cum Size</th>
+                </tr>
+    """
+
+    if not opportunities:
+        html += """
+                <tr>
+                    <td colspan="16">Aucune opportunité sniper détectée actuellement.</td>
+                </tr>
+        """
+
+    for idx, opp in enumerate(opportunities, start=1):
+        quality = "✅" if opp["quality"] else "❌"
+        price_source = "LIVE" if opp["live_price_used"] else "RECORDED"
+
+        html += f"""
+                <tr>
+                    <td>{idx}</td>
+                    <td><b>{opp['action']}</b></td>
+                    <td><b>{opp['score']:.1f}</b></td>
+                    <td>{opp['title']}</td>
+                    <td><b>{opp['outcome']}</b></td>
+                    <td>{opp['live_price']:.3f}<br><span class="small">{price_source}</span></td>
+                    <td>{opp['btc_price']:.2f}</td>
+                    <td>{opp['threshold']:.2f}</td>
+                    <td class="{roi_class(opp['distance_pct'])}"><b>{opp['distance_pct']:.2f}%</b></td>
+                    <td>{opp['minutes_left']:.1f} min</td>
+                    <td>{opp['market_type']}</td>
+                    <td>{quality}</td>
+                    <td>{opp['trade_grade']}</td>
+                    <td>{opp['probability_score']:.1f}</td>
+                    <td>{opp['reinforcement']}</td>
+                    <td>{opp['cumulative_size']:.2f}</td>
+                </tr>
+        """
+
+    html += """
+            </table>
+            <p class="small">
+                À utiliser uniquement comme signal supplémentaire.
+                Priorité réelle : SNIPER BUY + ML CONFIRMED BUY + VALIDATED/HIGH quand les signaux convergent.
             </p>
         </div>
     """
