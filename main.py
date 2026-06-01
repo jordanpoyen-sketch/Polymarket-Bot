@@ -1819,6 +1819,99 @@ def calculate_live_setup_score(probability_score, quality_signal, reinforcement_
 
     return max(0, min(100, live_score))
 
+
+def calculate_kelly_fraction(expected_roi, confidence, validation, price_risk):
+    expected_roi = float(expected_roi or 0)
+
+    if expected_roi <= 0:
+        return 0
+
+    base = expected_roi / 100
+
+    if confidence == "🟢 HIGH":
+        confidence_mult = 0.35
+    elif confidence == "🟡 MEDIUM":
+        confidence_mult = 0.22
+    elif confidence == "🟠 LOW":
+        confidence_mult = 0.12
+    else:
+        confidence_mult = 0.05
+
+    validation_mult = {
+        "VALIDATED": 1.00,
+        "PROMISING": 0.65,
+        "UNPROVEN": 0.30,
+        "NO HISTORY": 0.15,
+        "AVOID": 0.00
+    }.get(validation, 0.20)
+
+    price_mult = {
+        "HIGH UPSIDE": 1.00,
+        "BALANCED": 0.85,
+        "CONTROLLED": 0.60,
+        "LOW UPSIDE": 0.35,
+        "SPECULATIVE": 0.30,
+        "UNKNOWN": 0.00
+    }.get(price_risk, 0.30)
+
+    kelly = base * confidence_mult * validation_mult * price_mult * 100
+
+    return max(0, min(5, kelly))
+
+
+def decide_trade_action(live_score, expected_roi, confidence, validation, historical_count, price_risk):
+    live_score = float(live_score or 0)
+    expected_roi = float(expected_roi or 0)
+    historical_count = int(historical_count or 0)
+
+    if (
+        live_score >= 80
+        and expected_roi >= 10
+        and confidence in ["🟢 HIGH", "🟡 MEDIUM"]
+        and validation == "VALIDATED"
+        and historical_count >= 50
+    ):
+        return "BUY"
+
+    if (
+        live_score >= 72
+        and expected_roi >= 6
+        and validation in ["VALIDATED", "PROMISING"]
+        and historical_count >= 20
+    ):
+        return "WATCH"
+
+    return "SKIP"
+
+
+def get_best_trade_right_now(live_setups):
+    candidates = [
+        setup for setup in live_setups
+        if setup.get("action") == "BUY"
+    ]
+
+    if not candidates:
+        candidates = [
+            setup for setup in live_setups
+            if setup.get("action") == "WATCH"
+        ]
+
+    if not candidates:
+        return live_setups[0] if live_setups else None
+
+    return sorted(
+        candidates,
+        key=lambda x: (
+            x["action"] == "BUY",
+            x["expected_roi"],
+            x["live_score"],
+            x["historical_roi"]
+        ),
+        reverse=True
+    )[0]
+
+
+
 def get_live_setup_ranking(limit=30):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
@@ -1918,6 +2011,22 @@ def get_live_setup_ranking(limit=30):
             expected_roi
         )
 
+        kelly_fraction = calculate_kelly_fraction(
+            expected_roi,
+            confidence,
+            historical["label"],
+            price_info["label"]
+        )
+
+        action = decide_trade_action(
+            live_score,
+            expected_roi,
+            confidence,
+            historical["label"],
+            historical["count"],
+            price_info["label"]
+        )
+
         if key not in grouped:
             grouped[key] = {
                 "date": date_detected,
@@ -1946,6 +2055,8 @@ def get_live_setup_ranking(limit=30):
                 "price_risk": price_info["label"],
                 "payout_roi": price_info["expected_payout_roi"],
                 "confidence": confidence,
+                "kelly_fraction": kelly_fraction,
+                "action": action,
                 "live_score": live_score
             }
         else:
@@ -1967,6 +2078,8 @@ def get_live_setup_ranking(limit=30):
                 item["price_risk"] = price_info["label"]
                 item["payout_roi"] = price_info["expected_payout_roi"]
                 item["confidence"] = confidence
+                item["kelly_fraction"] = kelly_fraction
+                item["action"] = action
 
             if item["date"] < date_detected:
                 item["date"] = date_detected
@@ -1981,9 +2094,16 @@ def get_live_setup_ranking(limit=30):
         "AVOID": 0
     }
 
+    action_priority = {
+        "BUY": 3,
+        "WATCH": 2,
+        "SKIP": 1
+    }
+
     live = sorted(
         live,
         key=lambda x: (
+            action_priority.get(x.get("action"), 0),
             x["live_score"],
             x["expected_roi"],
             priority.get(x["validation"], 0),
@@ -2000,7 +2120,7 @@ def get_decision_cards():
     live = get_live_setup_ranking(50)
     stats = get_stats()
 
-    best_setup = live[0] if live else None
+    best_setup = get_best_trade_right_now(live)
     by_market = stats["by_market"]
     best_market = by_market[0] if by_market else None
 
@@ -2336,6 +2456,8 @@ def render_decision_cards(cards):
             <b>{best_setup['trade_grade']} — {best_setup['title']}</b><br>
             Outcome : {best_setup['outcome']}<br>
             Live Score : {best_setup['live_score']:.1f}/100<br>
+            Action : <b>{best_setup['action']}</b><br>
+            Kelly conseillé : {best_setup['kelly_fraction']:.2f}% bankroll<br>
             Expected ROI : {best_setup['expected_roi']:.2f}%<br>
             Historical ROI : {best_setup['historical_roi']:.2f}%<br>
             Confidence : {best_setup['confidence']}<br>
@@ -2378,17 +2500,29 @@ def render_decision_cards(cards):
     """
 
 
+
+def action_badge(action):
+    if action == "BUY":
+        return "🟢 BUY"
+    if action == "WATCH":
+        return "🟡 WATCH"
+    return "⚪ SKIP"
+
+
+
 def render_live_setups_table(rows):
     html = """
     <div class="section">
-        <h2>🔥 Top Live Setups V3</h2>
+        <h2>🔥 Top Live Setups V4</h2>
         <p class="small">
-            1 ligne = 1 marché/outcome. Classement V3 : score non saturé, Expected ROI, Price Risk,
-            Confidence Level, ROI historique et validation statistique.
+            Classement final : Action, Kelly %, Live Score, Expected ROI, Confidence, Price Risk,
+            ROI historique et validation statistique.
         </p>
         <table>
             <tr>
                 <th>Rank</th>
+                <th>Action</th>
+                <th>Kelly %</th>
                 <th>Live Score</th>
                 <th>Expected ROI</th>
                 <th>Confidence</th>
@@ -2412,7 +2546,7 @@ def render_live_setups_table(rows):
     if not rows:
         html += """
             <tr>
-                <td colspan="18">Aucun trade ouvert actuellement.</td>
+                <td colspan="20">Aucun trade ouvert actuellement.</td>
             </tr>
         """
 
@@ -2426,6 +2560,8 @@ def render_live_setups_table(rows):
         html += f"""
             <tr>
                 <td>{idx}</td>
+                <td><b>{action_badge(row['action'])}</b></td>
+                <td><b>{row['kelly_fraction']:.2f}%</b></td>
                 <td><b>{row['live_score']:.1f}</b></td>
                 <td class="{roi_class(row['expected_roi'])}"><b>{row['expected_roi']:.2f}%</b></td>
                 <td>{row['confidence']}</td>
@@ -2448,6 +2584,10 @@ def render_live_setups_table(rows):
 
     html += """
         </table>
+        <p class="small">
+            Règle Action : BUY = Score ≥80, Expected ROI ≥10%, HIGH/MEDIUM confidence, VALIDATED et ≥50 trades historiques.
+            WATCH = signal intéressant mais pas encore optimal. SKIP = ignorer.
+        </p>
     </div>
     """
 
