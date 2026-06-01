@@ -1597,12 +1597,156 @@ def get_cross_feature_stats(cross_type):
     return sorted(final, key=lambda x: x["weighted_roi"], reverse=True)
 
 
+def get_setup_historical_stats(market_type, outcome, price, quality_signal, reinforcement_count, cumulative_size, aggressiveness_score):
+    quality_key = 1 if quality_signal else 0
+
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT result, usdc_size, roi
+        FROM raw_trades
+        WHERE status = 'CLOSED'
+        AND COALESCE(market_type, '') = ?
+        AND outcome = ?
+        AND quality_signal = ?
+    """, (
+        market_type,
+        outcome,
+        quality_key
+    ))
+
+    rows = cursor.fetchall()
+    conn.close()
+
+    count = len(rows)
+    wins = sum(1 for result, _, _ in rows if result == "WIN")
+    losses = sum(1 for result, _, _ in rows if result == "LOSS")
+    total_size = sum(float(usdc_size or 0) for _, usdc_size, _ in rows)
+    weighted_pnl = sum(weighted_pnl_for_trade(result, usdc_size, roi) for result, usdc_size, roi in rows)
+
+    if count == 0 or total_size == 0:
+        return {
+            "count": 0,
+            "wins": 0,
+            "losses": 0,
+            "winrate": 0,
+            "weighted_roi": 0,
+            "weighted_pnl": 0,
+            "label": "NO HISTORY"
+        }
+
+    winrate = wins / count * 100
+    weighted_roi = weighted_pnl / total_size * 100
+
+    if count >= 50 and weighted_roi > 5 and winrate >= 75:
+        label = "VALIDATED"
+    elif count >= 20 and weighted_roi > 0 and winrate >= 60:
+        label = "PROMISING"
+    elif weighted_roi < 0:
+        label = "AVOID"
+    else:
+        label = "UNPROVEN"
+
+    return {
+        "count": count,
+        "wins": wins,
+        "losses": losses,
+        "winrate": winrate,
+        "weighted_roi": weighted_roi,
+        "weighted_pnl": weighted_pnl,
+        "label": label
+    }
+
+
+def calculate_live_setup_score(probability_score, quality_signal, reinforcement_count, cumulative_size, aggressiveness_score, historical_roi, historical_count, validation_label):
+    probability_score = float(probability_score or 0)
+    reinforcement_count = int(reinforcement_count or 1)
+    cumulative_size = float(cumulative_size or 0)
+    aggressiveness_score = int(aggressiveness_score or 1)
+    historical_roi = float(historical_roi or 0)
+    historical_count = int(historical_count or 0)
+
+    quality_component = 100 if quality_signal else 0
+
+    if reinforcement_count >= 50:
+        reinforcement_component = 100
+    elif reinforcement_count >= 20:
+        reinforcement_component = 85
+    elif reinforcement_count >= 10:
+        reinforcement_component = 70
+    elif reinforcement_count >= 4:
+        reinforcement_component = 45
+    elif reinforcement_count >= 2:
+        reinforcement_component = 25
+    else:
+        reinforcement_component = 10
+
+    if cumulative_size >= 50000:
+        size_component = 100
+    elif cumulative_size >= 20000:
+        size_component = 85
+    elif cumulative_size >= 5000:
+        size_component = 70
+    elif cumulative_size >= 2000:
+        size_component = 45
+    elif cumulative_size >= 500:
+        size_component = 25
+    else:
+        size_component = 10
+
+    aggressiveness_component = min(100, max(0, aggressiveness_score * 20))
+
+    if historical_roi >= 20:
+        historical_component = 100
+    elif historical_roi >= 10:
+        historical_component = 85
+    elif historical_roi >= 5:
+        historical_component = 70
+    elif historical_roi > 0:
+        historical_component = 55
+    elif historical_roi == 0:
+        historical_component = 40
+    else:
+        historical_component = 0
+
+    sample_bonus = 0
+    if historical_count >= 100:
+        sample_bonus = 5
+    elif historical_count >= 50:
+        sample_bonus = 3
+    elif historical_count >= 20:
+        sample_bonus = 1
+
+    validation_bonus = {
+        "VALIDATED": 8,
+        "PROMISING": 3,
+        "UNPROVEN": -3,
+        "NO HISTORY": -5,
+        "AVOID": -20
+    }.get(validation_label, 0)
+
+    live_score = (
+        0.30 * probability_score
+        + 0.20 * quality_component
+        + 0.18 * reinforcement_component
+        + 0.12 * size_component
+        + 0.10 * aggressiveness_component
+        + 0.10 * historical_component
+        + sample_bonus
+        + validation_bonus
+    )
+
+    return max(0, min(100, live_score))
+
+
 def get_live_setup_ranking(limit=30):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
 
     cursor.execute("""
         SELECT
+            id,
             date_detected,
             title,
             outcome,
@@ -1618,20 +1762,18 @@ def get_live_setup_ranking(limit=30):
             expected_edge
         FROM raw_trades
         WHERE status = 'OPEN'
-        ORDER BY
-            COALESCE(probability_score, 0) DESC,
-            COALESCE(cumulative_size, 0) DESC,
-            id DESC
-        LIMIT ?
-    """, (limit,))
+        ORDER BY id DESC
+        LIMIT 500
+    """)
 
     rows = cursor.fetchall()
     conn.close()
 
-    live = []
+    grouped = {}
 
     for row in rows:
         (
+            raw_id,
             date_detected,
             title,
             outcome,
@@ -1647,6 +1789,9 @@ def get_live_setup_ranking(limit=30):
             expected_edge
         ) = row
 
+        clean_market_type = market_type or classify_market(title)
+        key = f"{title} | {outcome}"
+
         if probability_score is None or trade_grade is None:
             probability_score, trade_grade, expected_edge, _ = calculate_probability_score(
                 title,
@@ -1657,23 +1802,111 @@ def get_live_setup_ranking(limit=30):
                 quality_signal
             )
 
-        live.append({
-            "date": date_detected,
-            "title": title,
-            "outcome": outcome,
-            "price": float(price or 0),
-            "usdc_size": float(usdc_size or 0),
-            "market_type": market_type or classify_market(title),
-            "quality": bool(quality_signal),
-            "reinforcement": int(reinforcement_count or 1),
-            "cumulative_size": float(cumulative_size or 0),
-            "aggressiveness": int(aggressiveness_score or 1),
-            "probability_score": float(probability_score or 0),
-            "trade_grade": trade_grade or "N/A",
-            "expected_edge": expected_edge or "N/A"
-        })
+        historical = get_setup_historical_stats(
+            clean_market_type,
+            outcome,
+            price,
+            quality_signal,
+            reinforcement_count,
+            cumulative_size,
+            aggressiveness_score
+        )
 
-    return live
+        live_score = calculate_live_setup_score(
+            probability_score,
+            quality_signal,
+            reinforcement_count,
+            cumulative_size,
+            aggressiveness_score,
+            historical["weighted_roi"],
+            historical["count"],
+            historical["label"]
+        )
+
+        if key not in grouped:
+            grouped[key] = {
+                "date": date_detected,
+                "title": title,
+                "outcome": outcome,
+                "price": float(price or 0),
+                "min_price": float(price or 0),
+                "max_price": float(price or 0),
+                "last_size": float(usdc_size or 0),
+                "total_size_visible": float(usdc_size or 0),
+                "market_type": clean_market_type,
+                "quality": bool(quality_signal),
+                "reinforcement": int(reinforcement_count or 1),
+                "cumulative_size": float(cumulative_size or 0),
+                "aggressiveness": int(aggressiveness_score or 1),
+                "probability_score": float(probability_score or 0),
+                "trade_grade": trade_grade or "N/A",
+                "expected_edge": expected_edge or "N/A",
+                "signals_visible": 1,
+                "historical_count": historical["count"],
+                "historical_winrate": historical["winrate"],
+                "historical_roi": historical["weighted_roi"],
+                "historical_pnl": historical["weighted_pnl"],
+                "validation": historical["label"],
+                "live_score": live_score
+            }
+        else:
+            item = grouped[key]
+            item["signals_visible"] += 1
+            item["total_size_visible"] += float(usdc_size or 0)
+            item["min_price"] = min(item["min_price"], float(price or 0))
+            item["max_price"] = max(item["max_price"], float(price or 0))
+            item["price"] = float(price or 0)
+            item["last_size"] = float(usdc_size or 0)
+            item["reinforcement"] = max(item["reinforcement"], int(reinforcement_count or 1))
+            item["cumulative_size"] = max(item["cumulative_size"], float(cumulative_size or 0))
+            item["aggressiveness"] = max(item["aggressiveness"], int(aggressiveness_score or 1))
+            item["probability_score"] = max(item["probability_score"], float(probability_score or 0))
+            item["live_score"] = max(item["live_score"], live_score)
+
+            if item["date"] < date_detected:
+                item["date"] = date_detected
+
+    live = list(grouped.values())
+
+    priority = {
+        "VALIDATED": 4,
+        "PROMISING": 3,
+        "UNPROVEN": 2,
+        "NO HISTORY": 1,
+        "AVOID": 0
+    }
+
+    live = sorted(
+        live,
+        key=lambda x: (
+            x["live_score"],
+            priority.get(x["validation"], 0),
+            x["historical_roi"],
+            x["cumulative_size"]
+        ),
+        reverse=True
+    )
+
+    return live[:limit]
+
+
+def get_decision_cards():
+    live = get_live_setup_ranking(50)
+    stats = get_stats()
+
+    best_setup = live[0] if live else None
+    by_market = stats["by_market"]
+    best_market = by_market[0] if by_market else None
+
+    strongest = None
+    if live:
+        strongest = sorted(live, key=lambda x: x["cumulative_size"], reverse=True)[0]
+
+    return {
+        "best_setup": best_setup,
+        "best_market": best_market,
+        "strongest": strongest
+    }
 
 
 def get_edge_health():
@@ -1974,14 +2207,83 @@ def render_curve(title, curve):
     return html
 
 
+def validation_badge(label):
+    if label == "VALIDATED":
+        return "🟢 VALIDATED"
+    if label == "PROMISING":
+        return "🟡 PROMISING"
+    if label == "AVOID":
+        return "🔴 AVOID"
+    if label == "NO HISTORY":
+        return "⚪ NO HISTORY"
+    return "🟠 UNPROVEN"
+
+
+def render_decision_cards(cards):
+    best_setup = cards.get("best_setup")
+    best_market = cards.get("best_market")
+    strongest = cards.get("strongest")
+
+    best_setup_html = "Aucun setup ouvert"
+    if best_setup:
+        best_setup_html = f"""
+            <b>{best_setup['trade_grade']} — {best_setup['title']}</b><br>
+            Outcome : {best_setup['outcome']}<br>
+            Live Score : {best_setup['live_score']:.1f}/100<br>
+            Historical ROI : {best_setup['historical_roi']:.2f}%<br>
+            Validation : {validation_badge(best_setup['validation'])}
+        """
+
+    best_market_html = "Aucune donnée"
+    if best_market:
+        best_market_html = f"""
+            <b>{best_market['name']}</b><br>
+            Weighted ROI : {best_market['weighted_roi']:.2f}%<br>
+            Winrate : {best_market['winrate']:.2f}%<br>
+            Trades : {best_market['count']}
+        """
+
+    strongest_html = "Aucun setup ouvert"
+    if strongest:
+        strongest_html = f"""
+            <b>{strongest['title']}</b><br>
+            Outcome : {strongest['outcome']}<br>
+            Cum Size : {strongest['cumulative_size']:.2f} USDC<br>
+            Reinforcement : {strongest['reinforcement']}
+        """
+
+    return f"""
+    <div class="grid">
+        <div class="kpi">
+            <div class="label">🔥 Best Setup Now</div>
+            <div class="small">{best_setup_html}</div>
+        </div>
+        <div class="kpi">
+            <div class="label">📈 Best Market Type</div>
+            <div class="small">{best_market_html}</div>
+        </div>
+        <div class="kpi">
+            <div class="label">🐋 Strongest Whale Conviction</div>
+            <div class="small">{strongest_html}</div>
+        </div>
+    </div>
+    """
+
+
 def render_live_setups_table(rows):
     html = """
     <div class="section">
-        <h2>🔥 Top Live Setups</h2>
+        <h2>🔥 Top Live Setups V2</h2>
+        <p class="small">
+            1 ligne = 1 marché/outcome. Le classement utilise : Probability Score, Quality, reinforcement, cumulative size,
+            aggressiveness et ROI historique du setup.
+        </p>
         <table>
             <tr>
+                <th>Rank</th>
+                <th>Live Score</th>
+                <th>Validation</th>
                 <th>Grade</th>
-                <th>Score</th>
                 <th>Market</th>
                 <th>Outcome</th>
                 <th>Prix</th>
@@ -1990,33 +2292,43 @@ def render_live_setups_table(rows):
                 <th>Reinf.</th>
                 <th>Cum Size</th>
                 <th>Agg.</th>
-                <th>Edge</th>
+                <th>Hist. Trades</th>
+                <th>Hist. ROI</th>
+                <th>Hist. Winrate</th>
             </tr>
     """
 
     if not rows:
         html += """
             <tr>
-                <td colspan="11">Aucun trade ouvert actuellement.</td>
+                <td colspan="15">Aucun trade ouvert actuellement.</td>
             </tr>
         """
 
-    for row in rows:
+    for idx, row in enumerate(rows, start=1):
         quality = "✅" if row["quality"] else "❌"
+        price_display = f"{row['price']:.3f}"
+
+        if row["min_price"] != row["max_price"]:
+            price_display = f"{row['min_price']:.3f} → {row['max_price']:.3f}"
 
         html += f"""
             <tr>
+                <td>{idx}</td>
+                <td><b>{row['live_score']:.1f}</b></td>
+                <td>{validation_badge(row['validation'])}</td>
                 <td><b>{row['trade_grade']}</b></td>
-                <td>{row['probability_score']:.1f}</td>
-                <td>{row['title']}</td>
+                <td>{row['title']}<br><span class="small">Signals visibles : {row['signals_visible']} | Dernier : {row['date']}</span></td>
                 <td>{row['outcome']}</td>
-                <td>{row['price']:.3f}</td>
+                <td>{price_display}</td>
                 <td>{row['market_type']}</td>
                 <td>{quality}</td>
                 <td>{row['reinforcement']}</td>
                 <td>{row['cumulative_size']:.2f}</td>
                 <td>{row['aggressiveness']}/5</td>
-                <td>{row['expected_edge']}</td>
+                <td>{row['historical_count']}</td>
+                <td class="{roi_class(row['historical_roi'])}">{row['historical_roi']:.2f}%</td>
+                <td>{row['historical_winrate']:.2f}%</td>
             </tr>
         """
 
@@ -2029,6 +2341,7 @@ def render_live_setups_table(rows):
 
 
 # --------------------------
+# ROUTES# --------------------------
 # ROUTES
 # --------------------------
 
@@ -2042,6 +2355,7 @@ def dashboard():
     stats = get_stats()
     health = get_edge_health()
     live_setups = get_live_setup_ranking(10)
+    decision_cards = get_decision_cards()
 
     html = html_header("Whale Dashboard")
 
@@ -2068,6 +2382,7 @@ def dashboard():
         </div>
     """
 
+    html += render_decision_cards(decision_cards)
     html += render_live_setups_table(live_setups)
 
     html += render_category_table("✅ Quality Signal — validation principale", stats["by_quality"])
@@ -2208,6 +2523,7 @@ def setups():
     backfill_clean_fields()
 
     live_setups = get_live_setup_ranking(50)
+    decision_cards = get_decision_cards()
 
     html = html_header("Live Setups")
     html += """
@@ -2218,6 +2534,7 @@ def setups():
             <p class="small">À utiliser en priorité pour voir les opportunités actuellement les plus intéressantes.</p>
         </div>
     """
+    html += render_decision_cards(decision_cards)
     html += render_live_setups_table(live_setups)
     html += html_footer()
 
