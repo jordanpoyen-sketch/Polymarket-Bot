@@ -3045,27 +3045,10 @@ def save_ml_prediction(row):
             final_score,
             validation,
             confidence,
-            status,
-            result,
-            actual_roi,
-            resolved_at
+            status
         )
-        VALUES (
-            COALESCE(
-                (SELECT prediction_date FROM ml_predictions WHERE raw_trade_id = ?),
-                ?
-            ),
-            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 
-            COALESCE(
-                (SELECT status FROM ml_predictions WHERE raw_trade_id = ?),
-                'OPEN'
-            ),
-            (SELECT result FROM ml_predictions WHERE raw_trade_id = ?),
-            (SELECT actual_roi FROM ml_predictions WHERE raw_trade_id = ?),
-            (SELECT resolved_at FROM ml_predictions WHERE raw_trade_id = ?)
-        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
-        raw_trade_id,
         datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         raw_trade_id,
         row.get("title"),
@@ -3087,16 +3070,11 @@ def save_ml_prediction(row):
         float(row.get("final_score") or 0),
         row.get("validation"),
         row.get("confidence"),
-        raw_trade_id,
-        raw_trade_id,
-        raw_trade_id,
-        raw_trade_id
-	"OPEN"
+        "OPEN"
     ))
 
     conn.commit()
     conn.close()
-
 
 def resolve_ml_predictions():
     ensure_ml_predictions_table()
