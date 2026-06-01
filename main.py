@@ -35,10 +35,12 @@ def init_db():
 	timeout=30,
 	check_same_thread=False
 )
+
+    cursor = conn.cursor()
+
     cursor.execute("PRAGMA journal_mode=WAL")
     cursor.execute("PRAGMA synchronous=NORMAL")
 
-    cursor = conn.cursor()
 
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS raw_trades (
