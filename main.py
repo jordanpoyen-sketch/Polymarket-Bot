@@ -7,7 +7,6 @@ import os
 import sqlite3
 import json
 from datetime import datetime, timezone
-from math import isnan
 
 
 app = FastAPI()
@@ -1485,11 +1484,387 @@ Lecture :
         time.sleep(60)
 
 
-def render_category_table(title, rows):
+
+# --------------------------
+# PRODUCT ANALYTICS HELPERS
+# --------------------------
+
+def get_cross_feature_stats(cross_type):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT
+            title,
+            outcome,
+            price,
+            usdc_size,
+            result,
+            roi,
+            market_type,
+            quality_signal,
+            reinforcement_count,
+            cumulative_size,
+            aggressiveness_score,
+            probability_score,
+            trade_grade
+        FROM raw_trades
+        WHERE status = 'CLOSED'
+    """)
+
+    rows = cursor.fetchall()
+    conn.close()
+
+    groups = {}
+
+    for (
+        title,
+        outcome,
+        price,
+        usdc_size,
+        result,
+        roi,
+        market_type,
+        quality_signal,
+        reinforcement_count,
+        cumulative_size,
+        aggressiveness_score,
+        probability_score,
+        trade_grade
+    ) in rows:
+        quality = "Quality" if quality_signal == 1 else "Excluded"
+
+        if cross_type == "quality_reinforcement":
+            key = f"{quality} | Reinforcement {reinforcement_bucket(reinforcement_count)}"
+
+        elif cross_type == "quality_aggressiveness":
+            key = f"{quality} | Aggressiveness {aggressiveness_score}"
+
+        elif cross_type == "quality_market":
+            clean_market_type = market_type or classify_market(title)
+            key = f"{quality} | {clean_market_type}"
+
+        elif cross_type == "quality_outcome":
+            key = f"{quality} | {outcome}"
+
+        elif cross_type == "grade_market":
+            clean_market_type = market_type or classify_market(title)
+            key = f"{trade_grade or 'Unknown'} | {clean_market_type}"
+
+        else:
+            key = "Other"
+
+        if key not in groups:
+            groups[key] = {
+                "count": 0,
+                "wins": 0,
+                "losses": 0,
+                "roi_sum": 0,
+                "weighted_pnl": 0,
+                "total_size": 0
+            }
+
+        groups[key]["count"] += 1
+
+        if result == "WIN":
+            groups[key]["wins"] += 1
+        elif result == "LOSS":
+            groups[key]["losses"] += 1
+
+        groups[key]["roi_sum"] += float(roi or 0)
+        groups[key]["weighted_pnl"] += weighted_pnl_for_trade(result, usdc_size, roi)
+        groups[key]["total_size"] += float(usdc_size or 0)
+
+    final = []
+
+    for key, data in groups.items():
+        count = data["count"]
+        wins = data["wins"]
+        total_size = data["total_size"]
+
+        final.append({
+            "name": key,
+            "count": count,
+            "wins": wins,
+            "losses": data["losses"],
+            "winrate": wins / count * 100 if count else 0,
+            "avg_roi": data["roi_sum"] / count if count else 0,
+            "weighted_pnl": data["weighted_pnl"],
+            "weighted_roi": data["weighted_pnl"] / total_size * 100 if total_size else 0,
+            "total_size": total_size
+        })
+
+    return sorted(final, key=lambda x: x["weighted_roi"], reverse=True)
+
+
+def get_live_setup_ranking(limit=30):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT
+            date_detected,
+            title,
+            outcome,
+            price,
+            usdc_size,
+            market_type,
+            quality_signal,
+            reinforcement_count,
+            cumulative_size,
+            aggressiveness_score,
+            probability_score,
+            trade_grade,
+            expected_edge
+        FROM raw_trades
+        WHERE status = 'OPEN'
+        ORDER BY
+            COALESCE(probability_score, 0) DESC,
+            COALESCE(cumulative_size, 0) DESC,
+            id DESC
+        LIMIT ?
+    """, (limit,))
+
+    rows = cursor.fetchall()
+    conn.close()
+
+    live = []
+
+    for row in rows:
+        (
+            date_detected,
+            title,
+            outcome,
+            price,
+            usdc_size,
+            market_type,
+            quality_signal,
+            reinforcement_count,
+            cumulative_size,
+            aggressiveness_score,
+            probability_score,
+            trade_grade,
+            expected_edge
+        ) = row
+
+        if probability_score is None or trade_grade is None:
+            probability_score, trade_grade, expected_edge, _ = calculate_probability_score(
+                title,
+                outcome,
+                price,
+                reinforcement_count,
+                cumulative_size,
+                quality_signal
+            )
+
+        live.append({
+            "date": date_detected,
+            "title": title,
+            "outcome": outcome,
+            "price": float(price or 0),
+            "usdc_size": float(usdc_size or 0),
+            "market_type": market_type or classify_market(title),
+            "quality": bool(quality_signal),
+            "reinforcement": int(reinforcement_count or 1),
+            "cumulative_size": float(cumulative_size or 0),
+            "aggressiveness": int(aggressiveness_score or 1),
+            "probability_score": float(probability_score or 0),
+            "trade_grade": trade_grade or "N/A",
+            "expected_edge": expected_edge or "N/A"
+        })
+
+    return live
+
+
+def get_edge_health():
+    stats = get_stats()
+
+    quality_rows = {row["name"]: row for row in stats["by_quality"]}
+    quality_roi = quality_rows.get("Quality", {}).get("weighted_roi", 0)
+    excluded_roi = quality_rows.get("Excluded", {}).get("weighted_roi", 0)
+
+    grade_rows = {row["name"]: row for row in stats.get("by_probability_grade", [])}
+    a_roi = grade_rows.get("A", {}).get("weighted_roi", 0)
+    ap_roi = grade_rows.get("A+", {}).get("weighted_roi", 0)
+    b_roi = grade_rows.get("B", {}).get("weighted_roi", 0)
+
+    score = 50
+    score += min(20, max(-20, quality_roi * 2))
+    score += min(15, max(-15, stats["weighted_roi"] * 2))
+    score += 10 if a_roi > 0 and ap_roi > 0 and b_roi > 0 else -10
+    score += 5 if excluded_roi < quality_roi else -5
+    score = max(0, min(100, score))
+
+    if score >= 80:
+        status = "🟢 Edge robuste"
+    elif score >= 60:
+        status = "🟡 Edge correct"
+    else:
+        status = "🔴 Edge fragile"
+
+    return {
+        "score": score,
+        "status": status,
+        "quality_roi": quality_roi,
+        "excluded_roi": excluded_roi,
+        "weighted_roi": stats["weighted_roi"]
+    }
+
+
+# --------------------------
+# UI HELPERS
+# --------------------------
+
+def html_header(title):
+    return f"""
+    <html>
+    <head>
+        <title>{title}</title>
+        <meta http-equiv="refresh" content="60">
+        <style>
+            body {{
+                background-color: #0f0f0f;
+                color: white;
+                font-family: Arial, sans-serif;
+                padding: 18px;
+                margin: 0;
+            }}
+            .nav {{
+                display: flex;
+                gap: 10px;
+                margin-bottom: 18px;
+                flex-wrap: wrap;
+            }}
+            .nav a {{
+                color: white;
+                background: #242424;
+                padding: 10px 14px;
+                border-radius: 8px;
+                text-decoration: none;
+                font-weight: bold;
+            }}
+            .nav a:hover {{
+                background: #333;
+            }}
+            .section {{
+                background-color: #1b1b1b;
+                padding: 16px;
+                margin-bottom: 16px;
+                border-radius: 12px;
+                border: 1px solid #2c2c2c;
+            }}
+            .grid {{
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+                gap: 12px;
+                margin-bottom: 16px;
+            }}
+            .kpi {{
+                background: #181818;
+                padding: 14px;
+                border-radius: 10px;
+                border: 1px solid #333;
+            }}
+            .kpi .label {{
+                color: #bbb;
+                font-size: 13px;
+            }}
+            .kpi .value {{
+                font-size: 26px;
+                font-weight: bold;
+                margin-top: 6px;
+            }}
+            h1 {{
+                color: orange;
+                margin-top: 0;
+            }}
+            h2 {{
+                margin-top: 0;
+            }}
+            table {{
+                width: 100%;
+                color: white;
+                border-collapse: collapse;
+                font-size: 14px;
+            }}
+            th, td {{
+                border: 1px solid #555;
+                padding: 7px;
+                vertical-align: top;
+            }}
+            th {{
+                background: #222;
+            }}
+            .positive {{
+                color: #00ff99;
+                font-weight: bold;
+            }}
+            .negative {{
+                color: #ff7777;
+                font-weight: bold;
+            }}
+            .neutral {{
+                color: #ddd;
+            }}
+            .small {{
+                color: #bbb;
+                font-size: 13px;
+            }}
+            .tag {{
+                display: inline-block;
+                padding: 3px 8px;
+                border-radius: 999px;
+                background: #333;
+                margin-right: 4px;
+                font-size: 12px;
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="nav">
+            <a href="/">Dashboard</a>
+            <a href="/analytics">Analytics</a>
+            <a href="/setups">Live Setups</a>
+        </div>
+    """
+
+
+def html_footer():
+    return """
+    </body>
+    </html>
+    """
+
+
+def roi_class(value):
+    try:
+        value = float(value)
+    except Exception:
+        value = 0
+
+    if value > 0:
+        return "positive"
+    if value < 0:
+        return "negative"
+    return "neutral"
+
+
+def render_kpi(label, value, suffix="", css_class=""):
+    return f"""
+        <div class="kpi">
+            <div class="label">{label}</div>
+            <div class="value {css_class}">{value}{suffix}</div>
+        </div>
+    """
+
+
+def render_category_table(title, rows, limit=None):
+    display_rows = rows[:limit] if limit else rows
+
     html = f"""
-    <div class="card">
+    <div class="section">
         <h2>{title}</h2>
-        <table border="1" cellpadding="6" cellspacing="0" style="width:100%; color:white; border-collapse:collapse;">
+        <table>
             <tr>
                 <th>Catégorie</th>
                 <th>Trades</th>
@@ -1502,7 +1877,14 @@ def render_category_table(title, rows):
             </tr>
     """
 
-    for row in rows:
+    if not display_rows:
+        html += """
+            <tr>
+                <td colspan="8">Aucune donnée disponible.</td>
+            </tr>
+        """
+
+    for row in display_rows:
         html += f"""
             <tr>
                 <td>{row['name']}</td>
@@ -1510,9 +1892,9 @@ def render_category_table(title, rows):
                 <td>{row['wins']}</td>
                 <td>{row['losses']}</td>
                 <td>{row['winrate']:.2f}%</td>
-                <td>{row['avg_roi']:.2f}%</td>
-                <td>{row['weighted_roi']:.2f}%</td>
-                <td>{row['weighted_pnl']:.2f}</td>
+                <td class="{roi_class(row['avg_roi'])}">{row['avg_roi']:.2f}%</td>
+                <td class="{roi_class(row['weighted_roi'])}">{row['weighted_roi']:.2f}%</td>
+                <td class="{roi_class(row['weighted_pnl'])}">{row['weighted_pnl']:.2f}</td>
             </tr>
         """
 
@@ -1524,12 +1906,11 @@ def render_category_table(title, rows):
     return html
 
 
-
 def render_validated_grades_table(rows):
     html = """
-    <div class="card">
+    <div class="section">
         <h2>✅ Validation A+ / A / B</h2>
-        <table border="1" cellpadding="6" cellspacing="0" style="width:100%; color:white; border-collapse:collapse;">
+        <table>
             <tr>
                 <th>Grade</th>
                 <th>Trades fermés</th>
@@ -1559,27 +1940,24 @@ def render_validated_grades_table(rows):
                 <td>{row['wins']}</td>
                 <td>{row['losses']}</td>
                 <td>{row['winrate']:.2f}%</td>
-                <td>{row['weighted_roi']:.2f}%</td>
-                <td>{row['weighted_pnl']:.2f}</td>
+                <td class="{roi_class(row['weighted_roi'])}">{row['weighted_roi']:.2f}%</td>
+                <td class="{roi_class(row['weighted_pnl'])}">{row['weighted_pnl']:.2f}</td>
                 <td>{validation}</td>
             </tr>
         """
 
     html += """
         </table>
-        <p>
-            Critère validation : minimum 10 trades fermés, Weighted ROI positif, Winrate ≥ 60%.
-        </p>
+        <p class="small">Critère validation : minimum 10 trades fermés, Weighted ROI positif, Winrate ≥ 60%.</p>
     </div>
     """
 
     return html
 
 
-
 def render_curve(title, curve):
     html = f"""
-    <div class="card">
+    <div class="section">
         <h2>{title}</h2>
     """
 
@@ -1587,7 +1965,7 @@ def render_curve(title, curve):
         html += "<p>Aucune donnée</p>"
     else:
         for point, pnl in curve:
-            html += f"<p>Trade {point} : {pnl}</p>"
+            html += f"<p>Trade {point} : <span class='{roi_class(pnl)}'>{pnl}</span></p>"
 
     html += """
     </div>
@@ -1595,6 +1973,64 @@ def render_curve(title, curve):
 
     return html
 
+
+def render_live_setups_table(rows):
+    html = """
+    <div class="section">
+        <h2>🔥 Top Live Setups</h2>
+        <table>
+            <tr>
+                <th>Grade</th>
+                <th>Score</th>
+                <th>Market</th>
+                <th>Outcome</th>
+                <th>Prix</th>
+                <th>Type</th>
+                <th>Quality</th>
+                <th>Reinf.</th>
+                <th>Cum Size</th>
+                <th>Agg.</th>
+                <th>Edge</th>
+            </tr>
+    """
+
+    if not rows:
+        html += """
+            <tr>
+                <td colspan="11">Aucun trade ouvert actuellement.</td>
+            </tr>
+        """
+
+    for row in rows:
+        quality = "✅" if row["quality"] else "❌"
+
+        html += f"""
+            <tr>
+                <td><b>{row['trade_grade']}</b></td>
+                <td>{row['probability_score']:.1f}</td>
+                <td>{row['title']}</td>
+                <td>{row['outcome']}</td>
+                <td>{row['price']:.3f}</td>
+                <td>{row['market_type']}</td>
+                <td>{quality}</td>
+                <td>{row['reinforcement']}</td>
+                <td>{row['cumulative_size']:.2f}</td>
+                <td>{row['aggressiveness']}/5</td>
+                <td>{row['expected_edge']}</td>
+            </tr>
+        """
+
+    html += """
+        </table>
+    </div>
+    """
+
+    return html
+
+
+# --------------------------
+# ROUTES
+# --------------------------
 
 @app.get("/", response_class=HTMLResponse)
 def dashboard():
@@ -1604,100 +2040,51 @@ def dashboard():
     btc_price = get_btc_price()
     btc_signal = get_model_signal(btc_price)
     stats = get_stats()
+    health = get_edge_health()
+    live_setups = get_live_setup_ranking(10)
 
-    html = f"""
-    <html>
-    <head>
-        <title>Whale Dashboard</title>
-        <meta http-equiv="refresh" content="60">
-        <style>
-            body {{
-                background-color: #111;
-                color: white;
-                font-family: Arial;
-                padding: 20px;
-            }}
-            .card {{
-                background-color: #1c1c1c;
-                padding: 15px;
-                margin-bottom: 15px;
-                border-radius: 10px;
-            }}
-            h1 {{
-                color: orange;
-            }}
-            .win {{
-                color: #00ff99;
-            }}
-            .loss {{
-                color: #ff6666;
-            }}
-            table {{
-                font-size: 14px;
-            }}
-        </style>
-    </head>
-    <body>
+    html = html_header("Whale Dashboard")
+
+    html += f"""
         <h1>🐋 Whale Dashboard</h1>
 
-        <div class="card">
-            <h2>BTC LIVE</h2>
-            <h1>{btc_price}</h1>
+        <div class="grid">
+            {render_kpi("BTC LIVE", f"{btc_price:.2f}")}
+            {render_kpi("Model Signal", btc_signal)}
+            {render_kpi("Edge Health", health["status"])}
+            {render_kpi("Edge Score", f"{health['score']:.0f}", "/100")}
         </div>
 
-        <div class="card">
-            <h2>Dernier scan</h2>
-            <h2>{last_scan_time}</h2>
-        </div>
-
-        <div class="card">
-            <h2>Model Signal</h2>
-            <h2>{btc_signal}</h2>
-        </div>
-
-        <div class="card">
-            <h2>📊 Raw Whale Trades</h2>
-            <p>Total raw : {stats["raw_total"]}</p>
-            <p>Raw closed : {stats["raw_closed"]}</p>
-            <p>Raw wins : {stats["raw_wins"]}</p>
-            <p>Raw losses : {stats["raw_losses"]}</p>
-            <p>Raw winrate : {stats["raw_winrate"]:.2f}%</p>
-            <p>Raw average ROI : {stats["raw_avg_roi"]:.2f}%</p>
-            <hr>
-            <p><b>Weighted whale PnL : {stats["weighted_pnl"]:.2f}</b></p>
-            <p><b>Weighted whale ROI : {stats["weighted_roi"]:.2f}%</b></p>
-            <p>Average WIN size : {stats["avg_win_size"]:.2f} USDC</p>
-            <p>Average LOSS size : {stats["avg_loss_size"]:.2f} USDC</p>
-        </div>
-
-        <div class="card">
-            <h2>📄 Paper Trades</h2>
-            <p>Total paper : {stats["paper_total"]}</p>
-            <p>Open : {stats["paper_open"]}</p>
-            <p>Closed : {stats["paper_closed"]}</p>
-            <p>Wins : {stats["paper_wins"]}</p>
-            <p>Losses : {stats["paper_losses"]}</p>
-            <p>Winrate : {stats["paper_winrate"]:.2f}%</p>
-            <p>Total PnL : {stats["paper_pnl"]:.2f} USDC</p>
+        <div class="section">
+            <h2>📌 Résumé décisionnel</h2>
+            <div class="grid">
+                {render_kpi("Raw closed", stats["raw_closed"])}
+                {render_kpi("Raw winrate", f"{stats['raw_winrate']:.2f}", "%")}
+                {render_kpi("Weighted whale ROI", f"{stats['weighted_roi']:.2f}", "%", roi_class(stats["weighted_roi"]))}
+                {render_kpi("Weighted whale PnL", f"{stats['weighted_pnl']:.2f}", "", roi_class(stats["weighted_pnl"]))}
+                {render_kpi("Paper PnL", f"{stats['paper_pnl']:.2f}", " USDC", roi_class(stats["paper_pnl"]))}
+                {render_kpi("Last scan", last_scan_time)}
+            </div>
         </div>
     """
 
-    html += render_category_table("✅ Analyse Quality Signals", stats["by_quality"])
-    html += render_category_table("📊 Analyse YES vs NO", stats["by_outcome"])
-    html += render_category_table("📊 Analyse par prix", stats["by_price"])
-    html += render_category_table("📊 Analyse par type de marché", stats["by_market"])
-    html += render_category_table("🕒 Analyse Entry Timing", stats["by_timing"])
-    html += render_category_table("🔥 Analyse Aggressiveness", stats["by_aggressiveness"])
-    html += render_category_table("🔁 Analyse Reinforcement", stats["by_reinforcement"])
-    html += render_category_table("💰 Cumulative Size Analytics", stats["by_cumulative_size"])
+    html += render_live_setups_table(live_setups)
+
+    html += render_category_table("✅ Quality Signal — validation principale", stats["by_quality"])
     html += render_category_table("🧠 Probability Grade Analytics", stats["by_probability_grade"])
     html += render_validated_grades_table(stats["validated_grades"])
 
     html += """
-    </body>
-    </html>
+        <div class="section">
+            <h2>📊 Marché & Prix</h2>
+            <p class="small">Ces tableaux servent à comprendre le régime dominant. Les décisions doivent surtout venir des combinaisons de features.</p>
+        </div>
     """
 
+    html += render_category_table("📊 Analyse par type de marché", stats["by_market"])
+    html += render_category_table("📊 Analyse par prix", stats["by_price"])
+
+    html += html_footer()
     return html
 
 
@@ -1706,69 +2093,47 @@ def analytics():
     init_db()
     backfill_clean_fields()
 
+    stats = get_stats()
     data = get_advanced_analytics()
 
-    html = """
-    <html>
-    <head>
-        <title>Whale Analytics</title>
-        <meta http-equiv="refresh" content="60">
-        <style>
-            body {
-                background-color: #111;
-                color: white;
-                font-family: Arial;
-                padding: 20px;
-            }
-            .card {
-                background-color: #1c1c1c;
-                padding: 15px;
-                margin-bottom: 15px;
-                border-radius: 10px;
-            }
-            h1 {
-                color: orange;
-            }
-            table {
-                width: 100%;
-                color: white;
-                border-collapse: collapse;
-            }
-            th, td {
-                border: 1px solid #555;
-                padding: 6px;
-            }
-        </style>
-    </head>
-    <body>
+    html = html_header("Whale Analytics")
+
+    html += """
         <h1>📊 Advanced Whale Analytics</h1>
+        <div class="section">
+            <h2>Ordre de lecture</h2>
+            <p>1. Valider que Quality reste positif.</p>
+            <p>2. Vérifier les grades A+ / A / B.</p>
+            <p>3. Lire les matrices Quality × Reinforcement et Quality × Aggressiveness.</p>
+            <p>4. Utiliser les Top Live Setups pour prioriser les opportunités ouvertes.</p>
+        </div>
     """
 
     html += f"""
-        <div class="card">
-            <h2>🧠 Confidence Score</h2>
-            <h1>{data["confidence_score"]:.1f}/100</h1>
-        </div>
-
-        <div class="card">
-            <h2>📈 Rolling Winrate</h2>
-            <p>Last 20 trades : {data["rolling_20"]:.2f}%</p>
-            <p>Last 50 trades : {data["rolling_50"]:.2f}%</p>
-            <p>Last 100 trades : {data["rolling_100"]:.2f}%</p>
+        <div class="grid">
+            {render_kpi("Confidence Score", f"{data["confidence_score"]:.1f}", "/100")}
+            {render_kpi("Rolling 20", f"{data["rolling_20"]:.2f}", "%")}
+            {render_kpi("Rolling 50", f"{data["rolling_50"]:.2f}", "%")}
+            {render_kpi("Rolling 100", f"{data["rolling_100"]:.2f}", "%")}
         </div>
     """
+
+    html += render_category_table("🥇 P1 — Quality × Reinforcement", get_cross_feature_stats("quality_reinforcement"))
+    html += render_category_table("🥇 P1 — Quality × Aggressiveness", get_cross_feature_stats("quality_aggressiveness"))
+    html += render_category_table("🥇 P1 — Quality × Market Type", get_cross_feature_stats("quality_market"))
+    html += render_category_table("🥇 P1 — Quality × Outcome", get_cross_feature_stats("quality_outcome"))
+
+    html += render_category_table("🔁 Reinforcement Analytics", stats["by_reinforcement"])
+    html += render_category_table("🔥 Aggressiveness Analytics", stats["by_aggressiveness"])
+    html += render_category_table("💰 Cumulative Size Analytics", stats["by_cumulative_size"])
+    html += render_category_table("🕒 Entry Timing Analytics", stats["by_timing"])
 
     html += render_curve("📉 Total Cumulative PnL — last 50", data["total_curve"])
     html += render_curve("✅ Quality Cumulative PnL — last 50", data["quality_curve"])
     html += render_curve("❌ Excluded Cumulative PnL — last 50", data["excluded_curve"])
 
-    html += render_category_table("🔁 Reinforcement Analytics", get_category_stats("reinforcement"))
-    html += render_category_table("💰 Cumulative Size Analytics", get_category_stats("cumulative_size"))
-    html += render_category_table("🧠 Probability Grade Analytics", get_probability_grade_stats())
-    html += render_validated_grades_table(get_validated_grade_stats())
-
     html += """
-        <div class="card">
+        <div class="section">
             <h2>🏆 Top Strategies min 20 trades</h2>
             <table>
                 <tr>
@@ -1790,8 +2155,8 @@ def analytics():
                     <td>{s["wins"]}</td>
                     <td>{s["losses"]}</td>
                     <td>{s["winrate"]:.2f}%</td>
-                    <td>{s["weighted_roi"]:.2f}%</td>
-                    <td>{s["weighted_pnl"]:.2f}</td>
+                    <td class="{roi_class(s["weighted_roi"])}">{s["weighted_roi"]:.2f}%</td>
+                    <td class="{roi_class(s["weighted_pnl"])}">{s["weighted_pnl"]:.2f}</td>
                 </tr>
         """
 
@@ -1801,7 +2166,7 @@ def analytics():
     """
 
     html += """
-        <div class="card">
+        <div class="section">
             <h2>🧠 Feature Combination Analytics min 10 trades</h2>
             <table>
                 <tr>
@@ -1823,183 +2188,38 @@ def analytics():
                     <td>{s["wins"]}</td>
                     <td>{s["losses"]}</td>
                     <td>{s["winrate"]:.2f}%</td>
-                    <td>{s["weighted_roi"]:.2f}%</td>
-                    <td>{s["weighted_pnl"]:.2f}</td>
+                    <td class="{roi_class(s["weighted_roi"])}">{s["weighted_roi"]:.2f}%</td>
+                    <td class="{roi_class(s["weighted_pnl"])}">{s["weighted_pnl"]:.2f}</td>
                 </tr>
         """
 
     html += """
             </table>
         </div>
-    </body>
-    </html>
     """
 
+    html += html_footer()
     return html
 
 
-@app.get("/ml", response_class=HTMLResponse)
-def ml_dashboard():
+@app.get("/setups", response_class=HTMLResponse)
+def setups():
     init_db()
     backfill_clean_fields()
 
-    result = run_xgboost_shadow_model()
+    live_setups = get_live_setup_ranking(50)
 
-    html = """
-    <html>
-    <head>
-        <title>Whale ML</title>
-        <meta http-equiv="refresh" content="60">
-        <style>
-            body {
-                background-color: #111;
-                color: white;
-                font-family: Arial;
-                padding: 20px;
-            }
-            .card {
-                background-color: #1c1c1c;
-                padding: 15px;
-                margin-bottom: 15px;
-                border-radius: 10px;
-            }
-            h1 {
-                color: orange;
-            }
-            table {
-                width: 100%;
-                color: white;
-                border-collapse: collapse;
-            }
-            th, td {
-                border: 1px solid #555;
-                padding: 6px;
-            }
-        </style>
-    </head>
-    <body>
-        <h1>🧠 XGBoost ML Shadow Mode</h1>
-    """
-
-    if not result.get("available"):
-        html += f"""
-        <div class="card">
-            <h2>Installation nécessaire</h2>
-            <p>{result.get("message")}</p>
-            <p>Erreur : {result.get("error")}</p>
-            <p>Ajoute dans requirements.txt :</p>
-            <pre>xgboost
-scikit-learn</pre>
-        </div>
-        </body></html>
-        """
-        return html
-
-    if not result.get("enough_data"):
-        html += f"""
-        <div class="card">
-            <h2>Pas encore assez de données</h2>
-            <p>{result.get("message")}</p>
-            <p>Trades fermés disponibles : {result.get("rows")}</p>
-        </div>
-        </body></html>
-        """
-        return html
-
-    html += f"""
-        <div class="card">
-            <h2>Dataset</h2>
-            <p>Trades utilisés : {result["rows"]}</p>
-            <p>Train : {result["train_rows"]}</p>
-            <p>Test : {result["test_rows"]}</p>
-            <p>Wins : {result["wins"]}</p>
-            <p>Losses : {result["losses"]}</p>
-        </div>
-
-        <div class="card">
-            <h2>Performance ML</h2>
-            <p>Accuracy : {result["accuracy"] * 100:.2f}%</p>
-            <p>Precision WIN : {result["precision"] * 100:.2f}%</p>
-            <p>Recall WIN : {result["recall"] * 100:.2f}%</p>
-        </div>
-
-        <div class="card">
-            <h2>Top Features</h2>
-            <table>
-                <tr>
-                    <th>Feature</th>
-                    <th>Importance</th>
-                </tr>
-    """
-
-    for name, importance in result["top_features"]:
-        html += f"""
-                <tr>
-                    <td>{name}</td>
-                    <td>{importance:.4f}</td>
-                </tr>
-        """
-
+    html = html_header("Live Setups")
     html += """
-            </table>
+        <h1>🔥 Live Setup Ranking</h1>
+        <div class="section">
+            <h2>Objectif</h2>
+            <p>Cette page classe les trades ouverts selon le Probability Score, la qualité, le reinforcement, la taille cumulée et l'agressivité.</p>
+            <p class="small">À utiliser en priorité pour voir les opportunités actuellement les plus intéressantes.</p>
         </div>
-
-        <div class="card">
-            <h2>Open Trades — ML Predictions</h2>
-            <table>
-                <tr>
-                    <th>Market</th>
-                    <th>Outcome</th>
-                    <th>Price</th>
-                    <th>Size</th>
-                    <th>Type</th>
-                    <th>Quality</th>
-                    <th>Reinf.</th>
-                    <th>Cum Size</th>
-                    <th>Rule Score</th>
-                    <th>Rule Grade</th>
-                    <th>ML Win %</th>
-                    <th>ML Grade</th>
-                </tr>
     """
-
-    if not result["open_predictions"]:
-        html += """
-                <tr>
-                    <td colspan="12">Aucun trade ouvert actuellement.</td>
-                </tr>
-        """
-
-    for pred in result["open_predictions"]:
-        html += f"""
-                <tr>
-                    <td>{pred["title"]}</td>
-                    <td>{pred["outcome"]}</td>
-                    <td>{float(pred["price"] or 0):.3f}</td>
-                    <td>{float(pred["usdc_size"] or 0):.2f}</td>
-                    <td>{pred["market_type"]}</td>
-                    <td>{bool(pred["quality_signal"])}</td>
-                    <td>{pred["reinforcement_count"]}</td>
-                    <td>{float(pred["cumulative_size"] or 0):.2f}</td>
-                    <td>{float(pred["probability_score"] or 0):.1f}</td>
-                    <td>{pred["trade_grade"]}</td>
-                    <td>{pred["ml_win_probability"]:.2f}%</td>
-                    <td>{pred["ml_grade"]}</td>
-                </tr>
-        """
-
-    html += """
-            </table>
-        </div>
-
-        <div class="card">
-            <h2>Mode</h2>
-            <p>Le ML est en shadow mode : il prédit, mais ne décide pas encore.</p>
-            <p>On compare ses prédictions aux grades A+ / A / B du probability model.</p>
-        </div>
-    </body>
-    </html>
-    """
+    html += render_live_setups_table(live_setups)
+    html += html_footer()
 
     return html
 
