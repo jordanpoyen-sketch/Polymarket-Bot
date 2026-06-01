@@ -2172,6 +2172,267 @@ def get_edge_health():
     }
 
 
+
+# --------------------------
+# PAPER TRADING VISIBILITY
+# --------------------------
+
+def get_paper_engine_stats():
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT COUNT(*) FROM paper_trades")
+    total = cursor.fetchone()[0]
+
+    cursor.execute("SELECT COUNT(*) FROM paper_trades WHERE status = 'OPEN'")
+    open_count = cursor.fetchone()[0]
+
+    cursor.execute("SELECT COUNT(*) FROM paper_trades WHERE status = 'CLOSED'")
+    closed = cursor.fetchone()[0]
+
+    cursor.execute("SELECT COUNT(*) FROM paper_trades WHERE result = 'WIN'")
+    wins = cursor.fetchone()[0]
+
+    cursor.execute("SELECT COUNT(*) FROM paper_trades WHERE result = 'LOSS'")
+    losses = cursor.fetchone()[0]
+
+    cursor.execute("""
+        SELECT COALESCE(SUM(pnl), 0)
+        FROM paper_trades
+        WHERE status = 'CLOSED'
+    """)
+    pnl = cursor.fetchone()[0]
+
+    cursor.execute("""
+        SELECT date_opened, title, outcome, entry_price, edge_score, result, pnl
+        FROM paper_trades
+        WHERE status = 'CLOSED'
+        ORDER BY id DESC
+        LIMIT 1
+    """)
+    last_closed = cursor.fetchone()
+
+    winrate = wins / closed * 100 if closed else 0
+    roi = pnl / closed * 100 if closed else 0
+
+    conn.close()
+
+    return {
+        "total": total,
+        "open": open_count,
+        "closed": closed,
+        "wins": wins,
+        "losses": losses,
+        "winrate": winrate,
+        "pnl": pnl,
+        "roi": roi,
+        "last_closed": last_closed
+    }
+
+
+def get_open_paper_trades(limit=100):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT
+            date_opened,
+            title,
+            outcome,
+            entry_price,
+            trade_size,
+            shares,
+            edge_score,
+            btc_live_open,
+            status
+        FROM paper_trades
+        WHERE status = 'OPEN'
+        ORDER BY id DESC
+        LIMIT ?
+    """, (limit,))
+
+    rows = cursor.fetchall()
+    conn.close()
+
+    return rows
+
+
+def get_recent_closed_paper_trades(limit=50):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT
+            date_opened,
+            title,
+            outcome,
+            entry_price,
+            trade_size,
+            shares,
+            edge_score,
+            result,
+            pnl
+        FROM paper_trades
+        WHERE status = 'CLOSED'
+        ORDER BY id DESC
+        LIMIT ?
+    """, (limit,))
+
+    rows = cursor.fetchall()
+    conn.close()
+
+    return rows
+
+
+def render_paper_engine_card():
+    paper = get_paper_engine_stats()
+
+    last = "Aucun trade fermé"
+    if paper["last_closed"]:
+        date_opened, title, outcome, entry_price, edge_score, result, pnl = paper["last_closed"]
+        last = f"""
+            {result} | PnL {float(pnl or 0):.2f} USDC<br>
+            {title}<br>
+            Outcome : {outcome} | Entry : {float(entry_price or 0):.3f}
+        """
+
+    html = f"""
+    <div class="section">
+        <h2>📄 Paper Trading Engine</h2>
+        <div class="grid">
+            {render_kpi("Total paper trades", paper["total"])}
+            {render_kpi("Open paper trades", paper["open"])}
+            {render_kpi("Closed paper trades", paper["closed"])}
+            {render_kpi("Paper wins", paper["wins"])}
+            {render_kpi("Paper losses", paper["losses"])}
+            {render_kpi("Paper winrate", f"{paper["winrate"]:.2f}", "%")}
+            {render_kpi("Paper PnL", f"{paper["pnl"]:.2f}", " USDC", roi_class(paper["pnl"]))}
+            {render_kpi("Paper ROI approx.", f"{paper["roi"]:.2f}", "%", roi_class(paper["roi"]))}
+        </div>
+        <div class="kpi">
+            <div class="label">Last closed paper trade</div>
+            <div class="small">{last}</div>
+        </div>
+    </div>
+    """
+
+    return html
+
+
+def render_open_paper_trades_table(rows):
+    html = """
+    <div class="section">
+        <h2>📌 Paper Trades ouverts à suivre avec 1$</h2>
+        <p class="small">
+            Ces lignes correspondent aux trades que le bot a ouverts en paper trading.
+            Tu peux les utiliser comme liste de suivi manuel.
+        </p>
+        <table>
+            <tr>
+                <th>Date</th>
+                <th>Market</th>
+                <th>Outcome</th>
+                <th>Entry Price</th>
+                <th>Paper Size</th>
+                <th>Shares</th>
+                <th>Edge Score</th>
+                <th>BTC Open</th>
+                <th>Status</th>
+            </tr>
+    """
+
+    if not rows:
+        html += """
+            <tr>
+                <td colspan="9">Aucun paper trade ouvert actuellement.</td>
+            </tr>
+        """
+
+    for row in rows:
+        (
+            date_opened,
+            title,
+            outcome,
+            entry_price,
+            trade_size,
+            shares,
+            edge_score,
+            btc_live_open,
+            status
+        ) = row
+
+        html += f"""
+            <tr>
+                <td>{date_opened}</td>
+                <td>{title}</td>
+                <td><b>{outcome}</b></td>
+                <td>{float(entry_price or 0):.3f}</td>
+                <td>{float(trade_size or 0):.2f} USDC</td>
+                <td>{float(shares or 0):.4f}</td>
+                <td>{edge_score}/10</td>
+                <td>{float(btc_live_open or 0):.2f}</td>
+                <td>{status}</td>
+            </tr>
+        """
+
+    html += """
+        </table>
+    </div>
+    """
+
+    return html
+
+
+def render_closed_paper_trades_table(rows):
+    html = """
+    <div class="section">
+        <h2>✅ Derniers Paper Trades fermés</h2>
+        <table>
+            <tr>
+                <th>Date</th>
+                <th>Market</th>
+                <th>Outcome</th>
+                <th>Entry Price</th>
+                <th>Size</th>
+                <th>Shares</th>
+                <th>Edge Score</th>
+                <th>Result</th>
+                <th>PnL</th>
+            </tr>
+    """
+
+    if not rows:
+        html += """
+            <tr>
+                <td colspan="9">Aucun paper trade fermé.</td>
+            </tr>
+        """
+
+    for row in rows:
+        date_opened, title, outcome, entry_price, trade_size, shares, edge_score, result, pnl = row
+
+        html += f"""
+            <tr>
+                <td>{date_opened}</td>
+                <td>{title}</td>
+                <td>{outcome}</td>
+                <td>{float(entry_price or 0):.3f}</td>
+                <td>{float(trade_size or 0):.2f}</td>
+                <td>{float(shares or 0):.4f}</td>
+                <td>{edge_score}/10</td>
+                <td>{result}</td>
+                <td class="{roi_class(pnl)}">{float(pnl or 0):.2f}</td>
+            </tr>
+        """
+
+    html += """
+        </table>
+    </div>
+    """
+
+    return html
+
+
 # --------------------------
 # UI HELPERS
 # --------------------------
@@ -2288,6 +2549,7 @@ def html_header(title):
             <a href="/setups">Live Setups</a>
             <a href="/ml">ML</a>
             <a href="/ml-performance">ML Performance</a>
+            <a href="/paper">Paper Trades</a>
         </div>
     """
 
@@ -2640,6 +2902,8 @@ def dashboard():
         </div>
     """
 
+    html += render_paper_engine_card()
+
     html += render_decision_cards(decision_cards)
     html += render_live_setups_table(live_setups)
 
@@ -2796,6 +3060,8 @@ def setups():
             <p class="small">À utiliser en priorité pour voir les opportunités actuellement les plus intéressantes.</p>
         </div>
     """
+    html += render_paper_engine_card()
+
     html += render_decision_cards(decision_cards)
     html += render_live_setups_table(live_setups)
     html += html_footer()
@@ -3763,6 +4029,35 @@ def ml_performance_dashboard():
             </table>
         </div>
     """
+
+    html += html_footer()
+    return html
+
+
+
+@app.get("/paper", response_class=HTMLResponse)
+def paper_trades_dashboard():
+    init_db()
+    backfill_clean_fields()
+    resolve_paper_trades()
+
+    open_rows = get_open_paper_trades(200)
+    closed_rows = get_recent_closed_paper_trades(75)
+
+    html = html_header("Paper Trades")
+
+    html += """
+        <h1>📄 Paper Trades</h1>
+        <div class="section">
+            <h2>Objectif</h2>
+            <p>Voir exactement quels trades le bot a décidé d'ouvrir en paper trading.</p>
+            <p class="small">Tu peux suivre manuellement les trades ouverts avec 1$ si tu veux tester le système en réel.</p>
+        </div>
+    """
+
+    html += render_paper_engine_card()
+    html += render_open_paper_trades_table(open_rows)
+    html += render_closed_paper_trades_table(closed_rows)
 
     html += html_footer()
     return html
