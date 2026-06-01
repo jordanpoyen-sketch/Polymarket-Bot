@@ -2795,6 +2795,471 @@ def setups():
     return html
 
 
+# --------------------------
+# XGBOOST ML SHADOW MODE
+# --------------------------
+
+def encode_market_type(value):
+    mapping = {
+        "Dip": 1,
+        "Range": 2,
+        "Reach": 3,
+        "Above": 4,
+        "Below": 5,
+        "Other": 0
+    }
+    return mapping.get(value or "Other", 0)
+
+
+def encode_outcome(value):
+    mapping = {
+        "Yes": 1,
+        "No": 0,
+        "Down": 2,
+        "Up": 3
+    }
+    return mapping.get(value, -1)
+
+
+def encode_entry_timing(value):
+    mapping = {
+        "Very Late": 5,
+        "Late": 4,
+        "Mid": 3,
+        "Early": 2,
+        "Post Expiry API": 1,
+        "Unknown": 0
+    }
+    return mapping.get(value or "Unknown", 0)
+
+
+def build_ml_dataset():
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT
+            title,
+            outcome,
+            price,
+            usdc_size,
+            market_type,
+            quality_signal,
+            reinforcement_count,
+            cumulative_size,
+            aggressiveness_score,
+            entry_timing,
+            probability_score,
+            result
+        FROM raw_trades
+        WHERE status = 'CLOSED'
+        AND result IN ('WIN', 'LOSS')
+    """)
+
+    rows = cursor.fetchall()
+    conn.close()
+
+    X = []
+    y = []
+
+    for row in rows:
+        (
+            title,
+            outcome,
+            price,
+            usdc_size,
+            market_type,
+            quality_signal,
+            reinforcement_count,
+            cumulative_size,
+            aggressiveness_score,
+            entry_timing,
+            probability_score,
+            result
+        ) = row
+
+        inferred_market_type = market_type or classify_market(title)
+        p = float(price or 0)
+        size = float(usdc_size or 0)
+        reinforcement = int(reinforcement_count or 1)
+        cumulative = float(cumulative_size or 0)
+        aggressive = int(aggressiveness_score or 1)
+        prob = float(probability_score or 50)
+
+        features = [
+            p,
+            size,
+            encode_market_type(inferred_market_type),
+            encode_outcome(outcome),
+            int(quality_signal or 0),
+            reinforcement,
+            cumulative,
+            aggressive,
+            encode_entry_timing(entry_timing),
+            prob,
+            1 if p < 0.70 else 0,
+            1 if 0.70 <= p < 0.90 else 0,
+            1 if p >= 0.90 else 0,
+            1 if inferred_market_type == "Dip" and outcome == "Yes" else 0,
+            1 if inferred_market_type == "Dip" and outcome == "No" else 0,
+            1 if inferred_market_type == "Range" and outcome == "Yes" else 0,
+            1 if inferred_market_type == "Above" and outcome == "No" else 0,
+            1 if inferred_market_type == "Reach" and outcome == "No" else 0
+        ]
+
+        X.append(features)
+        y.append(1 if result == "WIN" else 0)
+
+    return X, y
+
+
+def get_ml_feature_names():
+    return [
+        "price",
+        "usdc_size",
+        "market_type",
+        "outcome",
+        "quality_signal",
+        "reinforcement_count",
+        "cumulative_size",
+        "aggressiveness_score",
+        "entry_timing",
+        "probability_score",
+        "price_lt_070",
+        "price_070_090",
+        "price_gte_090",
+        "dip_yes",
+        "dip_no",
+        "range_yes",
+        "above_no",
+        "reach_no"
+    ]
+
+
+def features_from_live_setup(setup):
+    p = float(setup.get("price") or 0)
+    market_type = setup.get("market_type") or "Other"
+    outcome = setup.get("outcome")
+
+    return [
+        p,
+        float(setup.get("last_size") or 0),
+        encode_market_type(market_type),
+        encode_outcome(outcome),
+        1 if setup.get("quality") else 0,
+        int(setup.get("reinforcement") or 1),
+        float(setup.get("cumulative_size") or 0),
+        int(setup.get("aggressiveness") or 1),
+        0,
+        float(setup.get("probability_score") or 50),
+        1 if p < 0.70 else 0,
+        1 if 0.70 <= p < 0.90 else 0,
+        1 if p >= 0.90 else 0,
+        1 if market_type == "Dip" and outcome == "Yes" else 0,
+        1 if market_type == "Dip" and outcome == "No" else 0,
+        1 if market_type == "Range" and outcome == "Yes" else 0,
+        1 if market_type == "Above" and outcome == "No" else 0,
+        1 if market_type == "Reach" and outcome == "No" else 0
+    ]
+
+
+def run_xgboost_shadow_model():
+    try:
+        from xgboost import XGBClassifier
+        from sklearn.model_selection import train_test_split
+        from sklearn.metrics import accuracy_score, precision_score, recall_score, roc_auc_score
+    except Exception as e:
+        return {
+            "available": False,
+            "error": str(e),
+            "message": "XGBoost ou scikit-learn n'est pas installé. Ajoute xgboost et scikit-learn dans requirements.txt."
+        }
+
+    X, y = build_ml_dataset()
+
+    if len(X) < 200:
+        return {
+            "available": True,
+            "enough_data": False,
+            "rows": len(X),
+            "message": "Pas encore assez de trades fermés pour entraîner proprement XGBoost. Objectif minimum : 200."
+        }
+
+    positive = sum(y)
+    negative = len(y) - positive
+
+    if positive == 0 or negative == 0:
+        return {
+            "available": True,
+            "enough_data": False,
+            "rows": len(X),
+            "message": "Le dataset doit contenir des WIN et des LOSS."
+        }
+
+    test_size = 0.25
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X,
+        y,
+        test_size=test_size,
+        random_state=42,
+        stratify=y
+    )
+
+    model = XGBClassifier(
+        n_estimators=120,
+        max_depth=3,
+        learning_rate=0.06,
+        subsample=0.90,
+        colsample_bytree=0.90,
+        eval_metric="logloss",
+        random_state=42
+    )
+
+    model.fit(X_train, y_train)
+
+    preds = model.predict(X_test)
+    probs = model.predict_proba(X_test)[:, 1]
+
+    accuracy = accuracy_score(y_test, preds)
+    precision = precision_score(y_test, preds, zero_division=0)
+    recall = recall_score(y_test, preds, zero_division=0)
+
+    try:
+        auc = roc_auc_score(y_test, probs)
+    except Exception:
+        auc = 0
+
+    feature_names = get_ml_feature_names()
+    importances = model.feature_importances_
+
+    top_features = sorted(
+        zip(feature_names, importances),
+        key=lambda x: x[1],
+        reverse=True
+    )[:12]
+
+    live_setups = get_live_setup_ranking(50)
+    ml_predictions = []
+
+    for setup in live_setups:
+        features = features_from_live_setup(setup)
+        ml_win_probability = float(model.predict_proba([features])[0][1]) * 100
+
+        combined_score = (
+            0.55 * float(setup.get("live_score") or 0)
+            + 0.45 * ml_win_probability
+        )
+
+        if ml_win_probability >= 85:
+            ml_grade = "ML A+"
+        elif ml_win_probability >= 75:
+            ml_grade = "ML A"
+        elif ml_win_probability >= 65:
+            ml_grade = "ML B"
+        elif ml_win_probability >= 55:
+            ml_grade = "ML C"
+        else:
+            ml_grade = "ML D"
+
+        if (
+            setup.get("action") == "BUY"
+            and ml_win_probability >= 75
+            and combined_score >= 80
+        ):
+            ml_action = "ML CONFIRMED BUY"
+        elif (
+            setup.get("action") in ["BUY", "WATCH"]
+            and ml_win_probability >= 65
+        ):
+            ml_action = "ML WATCH"
+        else:
+            ml_action = "ML SKIP"
+
+        item = dict(setup)
+        item["ml_win_probability"] = ml_win_probability
+        item["ml_grade"] = ml_grade
+        item["combined_score"] = combined_score
+        item["ml_action"] = ml_action
+        ml_predictions.append(item)
+
+    ml_predictions = sorted(
+        ml_predictions,
+        key=lambda x: (
+            x["ml_action"] == "ML CONFIRMED BUY",
+            x["combined_score"],
+            x["expected_roi"]
+        ),
+        reverse=True
+    )
+
+    return {
+        "available": True,
+        "enough_data": True,
+        "rows": len(X),
+        "train_rows": len(X_train),
+        "test_rows": len(X_test),
+        "wins": positive,
+        "losses": negative,
+        "accuracy": accuracy,
+        "precision": precision,
+        "recall": recall,
+        "auc": auc,
+        "top_features": top_features,
+        "ml_predictions": ml_predictions[:30]
+    }
+
+
+def ml_action_badge(action):
+    if action == "ML CONFIRMED BUY":
+        return "🟢 ML CONFIRMED BUY"
+    if action == "ML WATCH":
+        return "🟡 ML WATCH"
+    return "⚪ ML SKIP"
+
+
+@app.get("/ml", response_class=HTMLResponse)
+def ml_dashboard():
+    init_db()
+    backfill_clean_fields()
+
+    result = run_xgboost_shadow_model()
+
+    html = html_header("XGBoost ML Shadow Mode")
+
+    html += """
+        <h1>🧠 XGBoost ML Shadow Mode</h1>
+        <div class="section">
+            <h2>Objectif</h2>
+            <p>Le modèle ML prédit WIN / LOSS sur les trades ouverts, mais ne décide pas encore seul.</p>
+            <p class="small">On compare : Action statistique V4, probabilité XGBoost et score combiné.</p>
+        </div>
+    """
+
+    if not result.get("available"):
+        html += f"""
+        <div class="section">
+            <h2>Installation nécessaire</h2>
+            <p>{result.get("message")}</p>
+            <p>Erreur : {result.get("error")}</p>
+            <p>Ajoute dans requirements.txt :</p>
+            <pre>xgboost
+scikit-learn</pre>
+        </div>
+        """
+        html += html_footer()
+        return html
+
+    if not result.get("enough_data"):
+        html += f"""
+        <div class="section">
+            <h2>Pas encore assez de données</h2>
+            <p>{result.get("message")}</p>
+            <p>Trades fermés disponibles : {result.get("rows")}</p>
+        </div>
+        """
+        html += html_footer()
+        return html
+
+    html += f"""
+        <div class="grid">
+            {render_kpi("Trades utilisés", result["rows"])}
+            {render_kpi("Accuracy", f"{result["accuracy"] * 100:.2f}", "%")}
+            {render_kpi("Precision WIN", f"{result["precision"] * 100:.2f}", "%")}
+            {render_kpi("Recall WIN", f"{result["recall"] * 100:.2f}", "%")}
+            {render_kpi("AUC", f"{result["auc"]:.3f}")}
+        </div>
+    """
+
+    html += """
+        <div class="section">
+            <h2>Top ML Features</h2>
+            <table>
+                <tr>
+                    <th>Feature</th>
+                    <th>Importance</th>
+                </tr>
+    """
+
+    for name, importance in result["top_features"]:
+        html += f"""
+                <tr>
+                    <td>{name}</td>
+                    <td>{importance:.4f}</td>
+                </tr>
+        """
+
+    html += """
+            </table>
+        </div>
+    """
+
+    html += """
+        <div class="section">
+            <h2>🔥 Live Setups — ML Confirmation</h2>
+            <table>
+                <tr>
+                    <th>Rank</th>
+                    <th>ML Action</th>
+                    <th>Stat Action</th>
+                    <th>Combined Score</th>
+                    <th>ML Win %</th>
+                    <th>ML Grade</th>
+                    <th>Expected ROI</th>
+                    <th>Kelly %</th>
+                    <th>Market</th>
+                    <th>Outcome</th>
+                    <th>Prix</th>
+                    <th>Validation</th>
+                    <th>Confidence</th>
+                    <th>Hist ROI</th>
+                    <th>Hist Trades</th>
+                </tr>
+    """
+
+    if not result["ml_predictions"]:
+        html += """
+                <tr>
+                    <td colspan="15">Aucun trade ouvert actuellement.</td>
+                </tr>
+        """
+
+    for idx, row in enumerate(result["ml_predictions"], start=1):
+        price_display = f"{row['price']:.3f}"
+
+        if row["min_price"] != row["max_price"]:
+            price_display = f"{row['min_price']:.3f} → {row['max_price']:.3f}"
+
+        html += f"""
+                <tr>
+                    <td>{idx}</td>
+                    <td><b>{ml_action_badge(row["ml_action"])}</b></td>
+                    <td>{action_badge(row["action"])}</td>
+                    <td><b>{row["combined_score"]:.1f}</b></td>
+                    <td><b>{row["ml_win_probability"]:.2f}%</b></td>
+                    <td>{row["ml_grade"]}</td>
+                    <td class="{roi_class(row["expected_roi"])}">{row["expected_roi"]:.2f}%</td>
+                    <td>{row["kelly_fraction"]:.2f}%</td>
+                    <td>{row["title"]}<br><span class="small">Signals visibles : {row["signals_visible"]}</span></td>
+                    <td>{row["outcome"]}</td>
+                    <td>{price_display}</td>
+                    <td>{validation_badge(row["validation"])}</td>
+                    <td>{row["confidence"]}</td>
+                    <td class="{roi_class(row["historical_roi"])}">{row["historical_roi"]:.2f}%</td>
+                    <td>{row["historical_count"]}</td>
+                </tr>
+        """
+
+    html += """
+            </table>
+        </div>
+    """
+
+    html += html_footer()
+    return html
+
+
+
 init_db()
 backfill_clean_fields()
 
