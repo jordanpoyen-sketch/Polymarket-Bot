@@ -2479,6 +2479,37 @@ def normalize_event_date_bucket(title):
     return "unknown"
 
 
+
+def get_live_outcome_price(slug, outcome):
+    if not slug or not outcome:
+        return None
+
+    market = get_market_data(slug)
+
+    if not market:
+        return None
+
+    outcomes_raw = market.get("outcomes")
+    prices_raw = market.get("outcomePrices")
+
+    try:
+        outcomes = json.loads(outcomes_raw) if isinstance(outcomes_raw, str) else outcomes_raw
+        prices = json.loads(prices_raw) if isinstance(prices_raw, str) else prices_raw
+
+        if not outcomes or not prices:
+            return None
+
+        for idx, item in enumerate(outcomes):
+            if str(item).lower() == str(outcome).lower():
+                return float(prices[idx])
+
+    except Exception as e:
+        print("Erreur live outcome price :", e)
+
+    return None
+
+
+
 def get_open_btc_markets_for_logical_arb():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
@@ -2488,6 +2519,7 @@ def get_open_btc_markets_for_logical_arb():
             id,
             date_detected,
             title,
+            slug,
             outcome,
             price,
             market_type,
@@ -2515,6 +2547,7 @@ def get_open_btc_markets_for_logical_arb():
             raw_id,
             date_detected,
             title,
+            slug,
             outcome,
             price,
             market_type,
@@ -2526,7 +2559,11 @@ def get_open_btc_markets_for_logical_arb():
         ) = row
 
         clean_type = market_type or classify_market(title)
-        clean_price = float(price or 0)
+
+        recorded_price = float(price or 0)
+        live_price = get_live_outcome_price(slug, outcome)
+        clean_price = live_price if live_price is not None else recorded_price
+
         threshold = extract_btc_threshold(title)
 
         key = (title, outcome)
@@ -2540,8 +2577,11 @@ def get_open_btc_markets_for_logical_arb():
             "id": raw_id,
             "date": date_detected,
             "title": title,
+            "slug": slug,
             "outcome": outcome,
             "price": clean_price,
+            "recorded_price": recorded_price,
+            "live_price_used": live_price is not None,
             "market_type": clean_type,
             "quality": bool(quality_signal),
             "reinforcement": int(reinforcement_count or 1),
@@ -4372,6 +4412,7 @@ def logical_arb_dashboard():
             <p class="small">
                 Exemple : BTC > 78k ne devrait jamais être plus cher que BTC > 76k sur la même période.
                 Si c'est le cas, le bot signale une anomalie.
+                Les prix affichés sont désormais les prix live Polymarket quand disponibles.
             </p>
         </div>
     """
@@ -4434,9 +4475,9 @@ def logical_arb_dashboard():
                     <td>{opp['type']}</td>
                     <td>{buy['title']}<br><span class="small">{opp['reason']}</span></td>
                     <td>{opp['outcome']}</td>
-                    <td>{buy['price']:.3f}</td>
+                    <td>{buy['price']:.3f}<br><span class="small">{'LIVE' if buy.get('live_price_used') else 'RECORDED'}</span></td>
                     <td>{compare['title']}</td>
-                    <td>{compare['price']:.3f}</td>
+                    <td>{compare['price']:.3f}<br><span class="small">{'LIVE' if compare.get('live_price_used') else 'RECORDED'}</span></td>
                     <td>{opp['rule']}</td>
                     <td>{quality}</td>
                     <td>{buy['reinforcement']}</td>
