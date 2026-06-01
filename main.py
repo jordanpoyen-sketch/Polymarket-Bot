@@ -30,7 +30,14 @@ last_scan_time = "Aucun scan"
 
 def init_db():
     os.makedirs("/data", exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(
+	DB_PATH,
+	timeout=30,
+	check_same_thread=False
+)
+    cursor.execute("PRAGMA journal_mode=WAL")
+    cursor.execute("PRAGMA synchronous=NORMAL")
+
     cursor = conn.cursor()
 
     cursor.execute("""
