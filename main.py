@@ -2764,6 +2764,10 @@ def analytics():
 
     html += """
             </table>
+            <p class="small">
+                Final Score = 35% Live Score V4 + 35% ML Win calibré + 15% Expected ROI + 15% Historical ROI.
+                ML Edge = ML Win % - Winrate historique du setup.
+            </p>
         </div>
     """
 
@@ -2968,6 +2972,7 @@ def run_xgboost_shadow_model():
         from xgboost import XGBClassifier
         from sklearn.model_selection import train_test_split
         from sklearn.metrics import accuracy_score, precision_score, recall_score, roc_auc_score
+        from sklearn.calibration import CalibratedClassifierCV
     except Exception as e:
         return {
             "available": False,
@@ -3006,7 +3011,7 @@ def run_xgboost_shadow_model():
         stratify=y
     )
 
-    model = XGBClassifier(
+    base_model = XGBClassifier(
         n_estimators=120,
         max_depth=3,
         learning_rate=0.06,
@@ -3014,6 +3019,12 @@ def run_xgboost_shadow_model():
         colsample_bytree=0.90,
         eval_metric="logloss",
         random_state=42
+    )
+
+    model = CalibratedClassifierCV(
+        estimator=base_model,
+        method="sigmoid",
+        cv=3
     )
 
     model.fit(X_train, y_train)
@@ -3031,7 +3042,11 @@ def run_xgboost_shadow_model():
         auc = 0
 
     feature_names = get_ml_feature_names()
-    importances = model.feature_importances_
+
+    try:
+        importances = model.calibrated_classifiers_[0].estimator.feature_importances_
+    except Exception:
+        importances = [0 for _ in feature_names]
 
     top_features = sorted(
         zip(feature_names, importances),
@@ -3046,10 +3061,23 @@ def run_xgboost_shadow_model():
         features = features_from_live_setup(setup)
         ml_win_probability = float(model.predict_proba([features])[0][1]) * 100
 
-        combined_score = (
-            0.55 * float(setup.get("live_score") or 0)
-            + 0.45 * ml_win_probability
+        historical_winrate = float(setup.get("historical_winrate") or 0)
+        historical_roi = float(setup.get("historical_roi") or 0)
+        expected_roi = float(setup.get("expected_roi") or 0)
+
+        ml_edge = ml_win_probability - historical_winrate
+
+        roi_component = max(0, min(100, expected_roi * 3))
+        historical_roi_component = max(0, min(100, historical_roi * 3))
+
+        final_score = (
+            0.35 * float(setup.get("live_score") or 0)
+            + 0.35 * ml_win_probability
+            + 0.15 * roi_component
+            + 0.15 * historical_roi_component
         )
+
+        combined_score = final_score
 
         if ml_win_probability >= 85:
             ml_grade = "ML A+"
@@ -3064,13 +3092,15 @@ def run_xgboost_shadow_model():
 
         if (
             setup.get("action") == "BUY"
-            and ml_win_probability >= 75
-            and combined_score >= 80
+            and ml_win_probability >= 70
+            and final_score >= 78
+            and expected_roi > 8
         ):
             ml_action = "ML CONFIRMED BUY"
         elif (
             setup.get("action") in ["BUY", "WATCH"]
-            and ml_win_probability >= 65
+            and ml_win_probability >= 60
+            and final_score >= 68
         ):
             ml_action = "ML WATCH"
         else:
@@ -3078,8 +3108,10 @@ def run_xgboost_shadow_model():
 
         item = dict(setup)
         item["ml_win_probability"] = ml_win_probability
+        item["ml_edge"] = ml_edge
         item["ml_grade"] = ml_grade
         item["combined_score"] = combined_score
+        item["final_score"] = final_score
         item["ml_action"] = ml_action
         ml_predictions.append(item)
 
@@ -3087,7 +3119,7 @@ def run_xgboost_shadow_model():
         ml_predictions,
         key=lambda x: (
             x["ml_action"] == "ML CONFIRMED BUY",
-            x["combined_score"],
+            x["final_score"],
             x["expected_roi"]
         ),
         reverse=True
@@ -3132,7 +3164,7 @@ def ml_dashboard():
         <div class="section">
             <h2>Objectif</h2>
             <p>Le modèle ML prédit WIN / LOSS sur les trades ouverts, mais ne décide pas encore seul.</p>
-            <p class="small">On compare : Action statistique V4, probabilité XGBoost et score combiné.</p>
+            <p class="small">On compare : Action statistique V4, XGBoost calibré, ML Edge et Final Hybrid Score.</p>
         </div>
     """
 
@@ -3168,6 +3200,7 @@ scikit-learn</pre>
             {render_kpi("Precision WIN", f"{result["precision"] * 100:.2f}", "%")}
             {render_kpi("Recall WIN", f"{result["recall"] * 100:.2f}", "%")}
             {render_kpi("AUC", f"{result["auc"]:.3f}")}
+            {render_kpi("Calibration", "Sigmoid")}
         </div>
     """
 
@@ -3202,8 +3235,9 @@ scikit-learn</pre>
                     <th>Rank</th>
                     <th>ML Action</th>
                     <th>Stat Action</th>
-                    <th>Combined Score</th>
-                    <th>ML Win %</th>
+                    <th>Final Score</th>
+                    <th>ML Win % calibré</th>
+                    <th>ML Edge</th>
                     <th>ML Grade</th>
                     <th>Expected ROI</th>
                     <th>Kelly %</th>
@@ -3220,7 +3254,7 @@ scikit-learn</pre>
     if not result["ml_predictions"]:
         html += """
                 <tr>
-                    <td colspan="15">Aucun trade ouvert actuellement.</td>
+                    <td colspan="16">Aucun trade ouvert actuellement.</td>
                 </tr>
         """
 
@@ -3235,8 +3269,9 @@ scikit-learn</pre>
                     <td>{idx}</td>
                     <td><b>{ml_action_badge(row["ml_action"])}</b></td>
                     <td>{action_badge(row["action"])}</td>
-                    <td><b>{row["combined_score"]:.1f}</b></td>
+                    <td><b>{row["final_score"]:.1f}</b></td>
                     <td><b>{row["ml_win_probability"]:.2f}%</b></td>
+                    <td class="{roi_class(row["ml_edge"])}">{row["ml_edge"]:.2f}%</td>
                     <td>{row["ml_grade"]}</td>
                     <td class="{roi_class(row["expected_roi"])}">{row["expected_roi"]:.2f}%</td>
                     <td>{row["kelly_fraction"]:.2f}%</td>
@@ -3252,6 +3287,10 @@ scikit-learn</pre>
 
     html += """
             </table>
+            <p class="small">
+                Final Score = 35% Live Score V4 + 35% ML Win calibré + 15% Expected ROI + 15% Historical ROI.
+                ML Edge = ML Win % - Winrate historique du setup.
+            </p>
         </div>
     """
 
