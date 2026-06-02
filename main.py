@@ -2627,16 +2627,34 @@ def extract_btc_threshold(title):
         return None
 
     import re
-    match = re.search(r"\$([0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)", title)
+
+    text = str(title).lower()
+
+    # Supports "$70,000", "$70k", "$150k", "$1m"
+    match = re.search(r"\$([0-9]+(?:\.[0-9]+)?)(?:,([0-9]{3}))?\s*([km])?", text)
 
     if not match:
         return None
 
     try:
-        return float(match.group(1).replace(",", ""))
+        first = match.group(1)
+        comma_part = match.group(2)
+        suffix = match.group(3)
+
+        if comma_part:
+            value = float(first + comma_part)
+        else:
+            value = float(first)
+
+        if suffix == "k":
+            value *= 1000
+        elif suffix == "m":
+            value *= 1000000
+
+        return float(value)
+
     except Exception:
         return None
-
 
 def normalize_event_date_bucket(title):
     if not title:
@@ -3075,132 +3093,174 @@ def calculate_sniper_score(distance_pct, minutes_left, live_price, quality, prob
 
 def get_active_btc_gamma_markets(limit=500):
     """
-    Broader Gamma scanner for Resolution Sniper.
-    The previous version only queried /markets once and found too few BTC markets.
-    This version tries multiple search queries and offsets, then deduplicates by slug/outcome.
+    Targeted Targeted Gamma scanner for short BTC markets.
+    It avoids broad long-term markets and searches directly for daily/hourly BTC market patterns.
     """
     result = []
     seen = set()
 
-    queries = ["bitcoin", "btc"]
-
-    endpoints_to_try = [
-        "https://gamma-api.polymarket.com/markets"
+    queries = [
+        "Will the price of Bitcoin be above",
+        "Will the price of Bitcoin be below",
+        "Will the price of Bitcoin be between",
+        "Will Bitcoin dip",
+        "Will Bitcoin reach",
+        "Bitcoin Up or Down",
+        "Bitcoin above",
+        "Bitcoin below",
+        "Bitcoin between",
+        "Bitcoin dip",
+        "Bitcoin reach",
     ]
 
-    for endpoint in endpoints_to_try:
-        for query in queries:
-            for offset in range(0, 1000, 100):
-                try:
-                    params_variants = [
-                        {
-                            "closed": "false",
-                            "active": "true",
-                            "limit": 100,
-                            "offset": offset,
-                            "q": query
-                        },
-                        {
-                            "closed": "false",
-                            "active": "true",
-                            "limit": 100,
-                            "offset": offset,
-                            "search": query
-                        },
-                        {
-                            "closed": "false",
-                            "active": "true",
-                            "limit": 100,
-                            "offset": offset
-                        }
-                    ]
+    for query in queries:
+        for offset in range(0, 500, 100):
+            try:
+                params_variants = [
+                    {
+                        "closed": "false",
+                        "active": "true",
+                        "limit": 100,
+                        "offset": offset,
+                        "q": query
+                    },
+                    {
+                        "closed": "false",
+                        "active": "true",
+                        "limit": 100,
+                        "offset": offset,
+                        "search": query
+                    },
+                    {
+                        "closed": "false",
+                        "active": "true",
+                        "limit": 100,
+                        "offset": offset,
+                        "query": query
+                    }
+                ]
 
-                    for params in params_variants:
-                        response = requests.get(endpoint, params=params, timeout=25)
+                for params in params_variants:
+                    response = requests.get(
+                        "https://gamma-api.polymarket.com/markets",
+                        params=params,
+                        timeout=25
+                    )
 
-                        if response.status_code != 200:
+                    if response.status_code != 200:
+                        continue
+
+                    data = response.json()
+
+                    if isinstance(data, dict):
+                        markets = (
+                            data.get("markets")
+                            or data.get("data")
+                            or data.get("results")
+                            or []
+                        )
+                    else:
+                        markets = data
+
+                    if not markets:
+                        continue
+
+                    for market in markets:
+                        title = (
+                            market.get("question")
+                            or market.get("title")
+                            or market.get("name")
+                            or ""
+                        )
+                        slug = market.get("slug") or ""
+                        text = f"{title} {slug}".lower()
+
+                        if "bitcoin" not in text and "btc" not in text:
                             continue
 
-                        data = response.json()
+                        # Keep only short-term style markets.
+                        short_keywords = [
+                            "on june",
+                            "on may",
+                            "today",
+                            "tomorrow",
+                            "up or down",
+                            "above $",
+                            "below $",
+                            "between $",
+                            "dip to $",
+                            "reach $"
+                        ]
 
-                        if isinstance(data, dict):
-                            markets = (
-                                data.get("markets")
-                                or data.get("data")
-                                or data.get("results")
-                                or []
-                            )
-                        else:
-                            markets = data
-
-                        if not markets:
+                        if not any(k in text for k in short_keywords):
                             continue
 
-                        for market in markets:
-                            title = (
-                                market.get("question")
-                                or market.get("title")
-                                or market.get("name")
-                                or ""
-                            )
-                            slug = market.get("slug") or ""
+                        # Exclude obviously long-term / thematic markets.
+                        blocked = [
+                            "before gta",
+                            "before 2027",
+                            "by december",
+                            "by june 30",
+                            "$1m",
+                            "$1 m",
+                            "150k",
+                            "reserve",
+                            "unban"
+                        ]
 
-                            text = f"{title} {slug}".lower()
+                        if any(b in text for b in blocked):
+                            continue
 
-                            if "bitcoin" not in text and "btc" not in text:
-                                continue
+                        outcomes_raw = market.get("outcomes")
+                        prices_raw = market.get("outcomePrices")
 
-                            outcomes_raw = market.get("outcomes")
-                            prices_raw = market.get("outcomePrices")
+                        try:
+                            outcomes = json.loads(outcomes_raw) if isinstance(outcomes_raw, str) else outcomes_raw
+                            prices = json.loads(prices_raw) if isinstance(prices_raw, str) else prices_raw
+                        except Exception:
+                            outcomes = None
+                            prices = None
 
+                        if not outcomes or not prices:
+                            continue
+
+                        for idx, outcome in enumerate(outcomes):
                             try:
-                                outcomes = json.loads(outcomes_raw) if isinstance(outcomes_raw, str) else outcomes_raw
-                                prices = json.loads(prices_raw) if isinstance(prices_raw, str) else prices_raw
+                                price = float(prices[idx])
                             except Exception:
-                                outcomes = None
-                                prices = None
-
-                            if not outcomes or not prices:
                                 continue
 
-                            for idx, outcome in enumerate(outcomes):
-                                try:
-                                    price = float(prices[idx])
-                                except Exception:
-                                    continue
+                            dedupe_key = (slug, str(outcome).lower())
 
-                                dedupe_key = (slug, str(outcome).lower())
+                            if dedupe_key in seen:
+                                continue
 
-                                if dedupe_key in seen:
-                                    continue
+                            seen.add(dedupe_key)
 
-                                seen.add(dedupe_key)
+                            result.append({
+                                "id": market.get("id") or slug,
+                                "date_detected": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                "title": title,
+                                "slug": slug,
+                                "outcome": str(outcome),
+                                "price": price,
+                                "market_type": classify_market(title),
+                                "quality_signal": 1 if is_quality_signal(title, str(outcome)) else 0,
+                                "reinforcement_count": 1,
+                                "cumulative_size": 0,
+                                "probability_score": 50,
+                                "trade_grade": "LIVE"
+                            })
 
-                                result.append({
-                                    "id": market.get("id") or slug,
-                                    "date_detected": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                                    "title": title,
-                                    "slug": slug,
-                                    "outcome": str(outcome),
-                                    "price": price,
-                                    "market_type": classify_market(title),
-                                    "quality_signal": 1 if is_quality_signal(title, str(outcome)) else 0,
-                                    "reinforcement_count": 1,
-                                    "cumulative_size": 0,
-                                    "probability_score": 50,
-                                    "trade_grade": "LIVE"
-                                })
+                if len(result) >= limit:
+                    print("SNIPER DEBUG - targeted gamma BTC markets:", len(result))
+                    return result[:limit]
 
-                    # Stop if enough markets collected.
-                    if len(result) >= limit:
-                        print("SNIPER DEBUG - broad gamma BTC markets:", len(result))
-                        return result[:limit]
+            except Exception as e:
+                print("Erreur targeted gamma scanner :", query, offset, e)
+                continue
 
-                except Exception as e:
-                    print("Erreur get_active_btc_gamma_markets offset/query :", query, offset, e)
-                    continue
-
-    print("SNIPER DEBUG - broad gamma BTC markets:", len(result))
+    print("SNIPER DEBUG - targeted gamma BTC markets:", len(result))
     return result[:limit]
 
 
@@ -3312,6 +3372,10 @@ def get_resolution_sniper_opportunities():
         threshold = extract_btc_threshold(title)
 
         if not threshold:
+            continue
+
+        # Ignore thematic/long-term thresholds accidentally parsed.
+        if threshold < 40000 or threshold > 200000:
             continue
 
         minutes_left = minutes_until_market_expiry(slug)
@@ -5324,7 +5388,7 @@ def sniper_debug_dashboard():
     html += f"""
         <div class="grid">
             {render_kpi("BTC Live", f"{btc_price:.2f}")}
-            {render_kpi("Gamma BTC rows", len(gamma_rows))}
+            {render_kpi("Targeted Gamma BTC rows", len(gamma_rows))}
             {render_kpi("Fallback raw rows", len(fallback_rows))}
             {render_kpi("Rows analysées", total_rows)}
             {render_kpi("Avec seuil", with_threshold)}
