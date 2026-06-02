@@ -2143,6 +2143,15 @@ def get_live_setup_ranking(limit=30):
         ) = row
 
         clean_market_type = market_type or classify_market(title)
+
+        recorded_price = float(price or 0)
+        live_price = get_live_outcome_price(slug, outcome)
+        price_source = "LIVE" if live_price is not None else "RECORDED"
+
+        # Critical fix:
+        # Top Live Setups must use the current Polymarket price, not the old whale entry price.
+        price = float(live_price) if live_price is not None else recorded_price
+
         key = f"{title} | {outcome}"
 
         if probability_score is None or trade_grade is None:
@@ -2240,6 +2249,8 @@ def get_live_setup_ranking(limit=30):
                 "title": title,
                 "outcome": outcome,
                 "price": float(price or 0),
+                "recorded_price": recorded_price,
+                "price_source": price_source,
                 "min_price": float(price or 0),
                 "max_price": float(price or 0),
                 "last_size": float(usdc_size or 0),
@@ -2274,6 +2285,8 @@ def get_live_setup_ranking(limit=30):
             item["min_price"] = min(item["min_price"], float(price or 0))
             item["max_price"] = max(item["max_price"], float(price or 0))
             item["price"] = float(price or 0)
+            item["recorded_price"] = recorded_price
+            item["price_source"] = price_source
             item["last_size"] = float(usdc_size or 0)
             item["reinforcement"] = max(item["reinforcement"], int(reinforcement_count or 1))
             item["cumulative_size"] = max(item["cumulative_size"], float(cumulative_size or 0))
@@ -3872,7 +3885,9 @@ def render_live_setups_table(rows):
         quality = "✅" if row["quality"] else "❌"
         price_display = f"{row['price']:.3f}"
 
-        if row["min_price"] != row["max_price"]:
+        if row.get("price_source") == "LIVE":
+            price_display = f"{row['price']:.3f} LIVE"
+        elif row["min_price"] != row["max_price"]:
             price_display = f"{row['min_price']:.3f} → {row['max_price']:.3f}"
 
         html += f"""
@@ -4893,7 +4908,9 @@ scikit-learn</pre>
     for idx, row in enumerate(result["ml_predictions"], start=1):
         price_display = f"{row['price']:.3f}"
 
-        if row["min_price"] != row["max_price"]:
+        if row.get("price_source") == "LIVE":
+            price_display = f"{row['price']:.3f} LIVE"
+        elif row["min_price"] != row["max_price"]:
             price_display = f"{row['min_price']:.3f} → {row['max_price']:.3f}"
 
         html += f"""
