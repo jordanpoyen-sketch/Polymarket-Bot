@@ -28,9 +28,22 @@ latest_edge_signals = []
 last_scan_time = "Aucun scan"
 
 
+def db_connect():
+    conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
+    try:
+        cursor = conn.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA synchronous=NORMAL")
+        cursor.execute("PRAGMA busy_timeout=30000")
+    except Exception as e:
+        print("Erreur PRAGMA SQLite :", e)
+    return conn
+
+
+
 def init_db():
     os.makedirs("/data", exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect()
     cursor = conn.cursor()
 
     cursor.execute("""
@@ -64,6 +77,22 @@ def init_db():
             status TEXT,
             result TEXT,
             pnl REAL
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS whale_activity (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            date_detected TEXT,
+            tx_hash TEXT UNIQUE,
+            wallet TEXT,
+            title TEXT,
+            slug TEXT,
+            outcome TEXT,
+            price REAL,
+            usdc_size REAL,
+            side TEXT,
+            raw_json TEXT
         )
     """)
 
@@ -423,7 +452,7 @@ def classify_entry_timing(minutes):
 
 
 def calculate_reinforcement_features(title, outcome):
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect()
     cursor = conn.cursor()
 
     cursor.execute("""
@@ -440,7 +469,7 @@ def calculate_reinforcement_features(title, outcome):
 
 
 def calculate_aggressiveness_score(title, outcome):
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect()
     cursor = conn.cursor()
 
     cursor.execute("""
@@ -467,7 +496,7 @@ def calculate_aggressiveness_score(title, outcome):
 
 
 def backfill_clean_fields():
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect()
     cursor = conn.cursor()
 
     cursor.execute("""
@@ -518,7 +547,7 @@ def backfill_clean_fields():
 
 
 def raw_trade_exists(tx_hash):
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect()
     cursor = conn.cursor()
 
     cursor.execute("SELECT COUNT(*) FROM raw_trades WHERE tx_hash = ?", (tx_hash,))
@@ -559,7 +588,7 @@ def save_raw_trade(activity, btc_price):
         quality_signal
     )
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect()
     cursor = conn.cursor()
 
     cursor.execute("""
@@ -631,7 +660,7 @@ def save_paper_trade(activity, btc_price, edge_score):
 
     shares = PAPER_TRADE_SIZE / price
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect()
     cursor = conn.cursor()
 
     try:
@@ -678,7 +707,7 @@ def save_paper_trade(activity, btc_price, edge_score):
 
 
 def resolve_raw_trades():
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect()
     cursor = conn.cursor()
 
     cursor.execute("""
@@ -732,7 +761,7 @@ def resolve_raw_trades():
 
 
 def resolve_paper_trades():
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect()
     cursor = conn.cursor()
 
     cursor.execute("""
@@ -784,7 +813,7 @@ def weighted_pnl_for_trade(result, usdc_size, roi):
 
 
 def get_category_stats(group_field):
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect()
     cursor = conn.cursor()
 
     cursor.execute("""
@@ -893,7 +922,7 @@ def get_category_stats(group_field):
 
 
 def get_probability_grade_stats():
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect()
     cursor = conn.cursor()
 
     cursor.execute("""
@@ -985,7 +1014,7 @@ def get_validated_grade_stats():
 
 
 def get_stats():
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect()
     cursor = conn.cursor()
 
     cursor.execute("SELECT COUNT(*) FROM raw_trades")
@@ -1142,7 +1171,7 @@ def get_stats():
 
 
 def get_advanced_analytics():
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect()
     cursor = conn.cursor()
 
     cursor.execute("""
@@ -1338,6 +1367,55 @@ def get_advanced_analytics():
     }
 
 
+
+def save_whale_activity(activity):
+    tx_hash = activity.get("transactionHash")
+
+    if not tx_hash:
+        return False
+
+    conn = db_connect()
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute("""
+            INSERT OR IGNORE INTO whale_activity (
+                date_detected,
+                tx_hash,
+                wallet,
+                title,
+                slug,
+                outcome,
+                price,
+                usdc_size,
+                side,
+                raw_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            tx_hash,
+            WALLET,
+            activity.get("title"),
+            activity.get("slug") or "",
+            activity.get("outcome"),
+            float(activity.get("price") or 0),
+            float(activity.get("usdcSize") or 0),
+            activity.get("side"),
+            json.dumps(activity)
+        ))
+
+        conn.commit()
+        conn.close()
+        return True
+
+    except Exception as e:
+        print("Erreur save_whale_activity :", e)
+        conn.close()
+        return False
+
+
+
 def whale_tracker_loop():
     global latest_edge_signals
     global last_scan_time
@@ -1369,6 +1447,8 @@ def whale_tracker_loop():
             print("Activités récupérées :", len(activities))
 
             for activity in activities:
+                save_whale_activity(activity)
+
                 title = str(activity.get("title"))
                 outcome = activity.get("outcome")
                 price = float(activity.get("price") or 0)
@@ -1490,7 +1570,7 @@ Lecture :
 # --------------------------
 
 def get_cross_feature_stats(cross_type):
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect()
     cursor = conn.cursor()
 
     cursor.execute("""
@@ -1600,7 +1680,7 @@ def get_cross_feature_stats(cross_type):
 def get_setup_historical_stats(market_type, outcome, price, quality_signal, reinforcement_count, cumulative_size, aggressiveness_score):
     quality_key = 1 if quality_signal else 0
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect()
     cursor = conn.cursor()
 
     cursor.execute("""
@@ -1700,26 +1780,95 @@ def estimate_expected_roi(historical_roi, probability_score, price, validation_l
     probability_score = float(probability_score or 0)
     price = float(price or 0)
 
-    payout_roi = ((1 - price) / price) * 100 if price > 0 else 0
-    probability_edge = (probability_score - 50) / 50
+    if price <= 0:
+        return 0
+
+    payout_roi = ((1 - price) / price) * 100
+
+    # The old formula overestimated low-upside trades at 0.97/0.99.
+    # Expected ROI is now capped by the actual payout available.
+    probability_edge = max(-1, min(1, (probability_score - 50) / 50))
     probability_roi = payout_roi * probability_edge
 
-    base = (0.70 * historical_roi) + (0.30 * probability_roi)
+    base = (0.45 * historical_roi) + (0.55 * probability_roi)
 
     if validation_label == "VALIDATED":
-        base *= 1.10
-    elif validation_label == "PROMISING":
         base *= 1.00
+    elif validation_label == "PROMISING":
+        base *= 0.90
     elif validation_label == "UNPROVEN":
-        base *= 0.70
+        base *= 0.60
     elif validation_label == "NO HISTORY":
-        base *= 0.50
+        base *= 0.40
     elif validation_label == "AVOID":
-        base *= 0.20
+        base *= 0.15
+
+    if base > 0:
+        base = min(base, payout_roi * 0.85)
 
     return base
 
 
+def calculate_historical_pattern_score(market_type, outcome, quality_signal, reinforcement_count, cumulative_size, aggressiveness_score, entry_timing=None, price=None):
+    market_type = market_type or "Other"
+    outcome = outcome or ""
+    quality_signal = 1 if quality_signal else 0
+    reinforcement_count = int(reinforcement_count or 1)
+    cumulative_size = float(cumulative_size or 0)
+    aggressiveness_score = int(aggressiveness_score or 1)
+    price = float(price or 0)
+
+    score = 50
+
+    if reinforcement_count >= 10:
+        score += 18
+    elif reinforcement_count >= 4:
+        score += 3
+    elif reinforcement_count >= 2:
+        score -= 5
+
+    if cumulative_size >= 5000:
+        score += 10
+    elif cumulative_size >= 2000:
+        score += 2
+    elif cumulative_size < 500:
+        score -= 2
+
+    if aggressiveness_score >= 5:
+        score += 10
+    elif aggressiveness_score == 4:
+        score += 8
+    elif aggressiveness_score == 3:
+        score -= 8
+
+    if entry_timing in ["Very Late", "Late", "Mid"]:
+        score += 12
+    elif entry_timing == "Early":
+        score -= 4
+
+    # Quality is now a context signal, not an absolute truth.
+    if quality_signal and outcome == "No":
+        score += 12
+    if quality_signal and outcome == "Yes":
+        score -= 8
+
+    if market_type == "Dip" and not quality_signal:
+        score += 15
+    if market_type == "Dip" and quality_signal:
+        score -= 20
+
+    if market_type in ["Above", "Range", "Reach"] and quality_signal:
+        score += 6
+
+    # Low-upside penalty.
+    if price >= 0.985:
+        score -= 22
+    elif price >= 0.97:
+        score -= 15
+    elif price >= 0.95:
+        score -= 8
+
+    return max(0, min(100, score))
 
 def calculate_live_setup_score(probability_score, quality_signal, reinforcement_count, cumulative_size, aggressiveness_score, historical_roi, historical_count, validation_label, price, expected_roi):
     probability_score = float(probability_score or 0)
@@ -1864,25 +2013,31 @@ def decide_trade_action(live_score, expected_roi, confidence, validation, histor
     expected_roi = float(expected_roi or 0)
     historical_count = int(historical_count or 0)
 
+    # Avoid BUY on ultra-low-upside markets unless score is exceptional.
+    if price_risk == "LOW UPSIDE" and live_score < 88:
+        if live_score >= 74 and expected_roi >= 1.5:
+            return "WATCH"
+        return "SKIP"
+
     if (
-        live_score >= 80
-        and expected_roi >= 10
+        live_score >= 82
+        and expected_roi >= 4
         and confidence in ["🟢 HIGH", "🟡 MEDIUM"]
-        and validation == "VALIDATED"
-        and historical_count >= 50
+        and validation in ["VALIDATED", "PROMISING"]
+        and historical_count >= 30
+        and price_risk != "LOW UPSIDE"
     ):
         return "BUY"
 
     if (
-        live_score >= 72
-        and expected_roi >= 6
+        live_score >= 70
+        and expected_roi >= 2
         and validation in ["VALIDATED", "PROMISING"]
         and historical_count >= 20
     ):
         return "WATCH"
 
     return "SKIP"
-
 
 def get_best_trade_right_now(live_setups):
     candidates = [
@@ -1913,7 +2068,7 @@ def get_best_trade_right_now(live_setups):
 
 
 def get_live_setup_ranking(limit=30):
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect()
     cursor = conn.cursor()
 
     cursor.execute("""
@@ -1929,6 +2084,7 @@ def get_live_setup_ranking(limit=30):
             reinforcement_count,
             cumulative_size,
             aggressiveness_score,
+            entry_timing,
             probability_score,
             trade_grade,
             expected_edge
@@ -1956,6 +2112,7 @@ def get_live_setup_ranking(limit=30):
             reinforcement_count,
             cumulative_size,
             aggressiveness_score,
+            entry_timing,
             probability_score,
             trade_grade,
             expected_edge
@@ -2011,6 +2168,31 @@ def get_live_setup_ranking(limit=30):
             expected_roi
         )
 
+        historical_pattern_score = calculate_historical_pattern_score(
+            clean_market_type,
+            outcome,
+            quality_signal,
+            reinforcement_count,
+            cumulative_size,
+            aggressiveness_score,
+            entry_timing,
+            price
+        )
+
+        payout_roi_now = price_info["expected_payout_roi"]
+
+        live_score = (
+            0.65 * live_score
+            + 0.35 * historical_pattern_score
+        )
+
+        if payout_roi_now < 2:
+            live_score -= 18
+        elif payout_roi_now < 4:
+            live_score -= 10
+
+        live_score = max(0, min(100, live_score))
+
         kelly_fraction = calculate_kelly_fraction(
             expected_roi,
             confidence,
@@ -2056,6 +2238,7 @@ def get_live_setup_ranking(limit=30):
                 "price_risk": price_info["label"],
                 "payout_roi": price_info["expected_payout_roi"],
                 "confidence": confidence,
+                "historical_pattern_score": historical_pattern_score,
                 "kelly_fraction": kelly_fraction,
                 "action": action,
                 "live_score": live_score
@@ -2079,6 +2262,7 @@ def get_live_setup_ranking(limit=30):
                 item["price_risk"] = price_info["label"]
                 item["payout_roi"] = price_info["expected_payout_roi"]
                 item["confidence"] = confidence
+                item["historical_pattern_score"] = historical_pattern_score
                 item["kelly_fraction"] = kelly_fraction
                 item["action"] = action
 
@@ -2178,7 +2362,7 @@ def get_edge_health():
 # --------------------------
 
 def get_paper_engine_stats():
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect()
     cursor = conn.cursor()
 
     cursor.execute("SELECT COUNT(*) FROM paper_trades")
@@ -2231,7 +2415,7 @@ def get_paper_engine_stats():
 
 
 def get_open_paper_trades(limit=100):
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect()
     cursor = conn.cursor()
 
     cursor.execute("""
@@ -2258,7 +2442,7 @@ def get_open_paper_trades(limit=100):
 
 
 def get_recent_closed_paper_trades(limit=50):
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect()
     cursor = conn.cursor()
 
     cursor.execute("""
@@ -2511,7 +2695,7 @@ def get_live_outcome_price(slug, outcome):
 
 
 def get_open_btc_markets_for_logical_arb():
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect()
     cursor = conn.cursor()
 
     cursor.execute("""
@@ -2887,10 +3071,81 @@ def calculate_sniper_score(distance_pct, minutes_left, live_price, quality, prob
     return max(0, min(100, score))
 
 
-def get_resolution_sniper_opportunities():
-    btc_price = get_btc_price()
 
-    conn = sqlite3.connect(DB_PATH)
+def get_active_btc_gamma_markets(limit=500):
+    try:
+        url = "https://gamma-api.polymarket.com/markets"
+        params = {
+            "closed": "false",
+            "active": "true",
+            "limit": limit
+        }
+
+        response = requests.get(url, params=params, timeout=25)
+
+        if response.status_code != 200:
+            print("Erreur gamma active markets :", response.text[:300])
+            return []
+
+        data = response.json()
+
+        if isinstance(data, dict):
+            markets = data.get("markets") or data.get("data") or []
+        else:
+            markets = data
+
+        result = []
+
+        for market in markets:
+            title = market.get("question") or market.get("title") or market.get("name") or ""
+            slug = market.get("slug") or ""
+
+            if "bitcoin" not in title.lower() and "btc" not in title.lower():
+                continue
+
+            outcomes_raw = market.get("outcomes")
+            prices_raw = market.get("outcomePrices")
+
+            try:
+                outcomes = json.loads(outcomes_raw) if isinstance(outcomes_raw, str) else outcomes_raw
+                prices = json.loads(prices_raw) if isinstance(prices_raw, str) else prices_raw
+            except Exception:
+                outcomes = None
+                prices = None
+
+            if not outcomes or not prices:
+                continue
+
+            for idx, outcome in enumerate(outcomes):
+                try:
+                    price = float(prices[idx])
+                except Exception:
+                    continue
+
+                result.append({
+                    "id": market.get("id") or slug,
+                    "date_detected": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "title": title,
+                    "slug": slug,
+                    "outcome": str(outcome),
+                    "price": price,
+                    "market_type": classify_market(title),
+                    "quality_signal": 1 if is_quality_signal(title, str(outcome)) else 0,
+                    "reinforcement_count": 1,
+                    "cumulative_size": 0,
+                    "probability_score": 50,
+                    "trade_grade": "LIVE"
+                })
+
+        return result
+
+    except Exception as e:
+        print("Erreur get_active_btc_gamma_markets :", e)
+        return []
+
+
+def get_raw_trade_btc_markets_for_sniper():
+    conn = db_connect()
     cursor = conn.cursor()
 
     cursor.execute("""
@@ -2918,8 +3173,7 @@ def get_resolution_sniper_opportunities():
     rows = cursor.fetchall()
     conn.close()
 
-    opportunities = []
-    seen = set()
+    result = []
 
     for row in rows:
         (
@@ -2928,7 +3182,7 @@ def get_resolution_sniper_opportunities():
             title,
             slug,
             outcome,
-            recorded_price,
+            price,
             market_type,
             quality_signal,
             reinforcement_count,
@@ -2936,6 +3190,50 @@ def get_resolution_sniper_opportunities():
             probability_score,
             trade_grade
         ) = row
+
+        result.append({
+            "id": raw_id,
+            "date_detected": date_detected,
+            "title": title,
+            "slug": slug,
+            "outcome": outcome,
+            "price": float(price or 0),
+            "market_type": market_type or classify_market(title),
+            "quality_signal": quality_signal,
+            "reinforcement_count": reinforcement_count,
+            "cumulative_size": cumulative_size,
+            "probability_score": probability_score,
+            "trade_grade": trade_grade
+        })
+
+    return result
+
+
+
+def get_resolution_sniper_opportunities():
+    btc_price = get_btc_price()
+
+    market_rows = get_active_btc_gamma_markets(500)
+
+    if not market_rows:
+        market_rows = get_raw_trade_btc_markets_for_sniper()
+
+    opportunities = []
+    seen = set()
+
+    for row in market_rows:
+        raw_id = row.get("id")
+        date_detected = row.get("date_detected")
+        title = row.get("title")
+        slug = row.get("slug")
+        outcome = row.get("outcome")
+        recorded_price = row.get("price")
+        market_type = row.get("market_type")
+        quality_signal = row.get("quality_signal")
+        reinforcement_count = row.get("reinforcement_count")
+        cumulative_size = row.get("cumulative_size")
+        probability_score = row.get("probability_score")
+        trade_grade = row.get("trade_grade")
 
         key = (title, outcome)
 
@@ -2983,7 +3281,7 @@ def get_resolution_sniper_opportunities():
         if distance_pct is None:
             continue
 
-        if distance_pct < 1:
+        if distance_pct < 0.35:
             continue
 
         if not is_favorable:
@@ -3393,6 +3691,7 @@ def render_live_setups_table(rows):
                 <th>Kelly %</th>
                 <th>Live Score</th>
                 <th>Expected ROI</th>
+                <th>HPS</th>
                 <th>Confidence</th>
                 <th>Validation</th>
                 <th>Grade</th>
@@ -3414,7 +3713,7 @@ def render_live_setups_table(rows):
     if not rows:
         html += """
             <tr>
-                <td colspan="20">Aucun trade ouvert actuellement.</td>
+                <td colspan="21">Aucun trade ouvert actuellement.</td>
             </tr>
         """
 
@@ -3432,6 +3731,7 @@ def render_live_setups_table(rows):
                 <td><b>{row['kelly_fraction']:.2f}%</b></td>
                 <td><b>{row['live_score']:.1f}</b></td>
                 <td class="{roi_class(row['expected_roi'])}"><b>{row['expected_roi']:.2f}%</b></td>
+                <td><b>{row.get('historical_pattern_score', 0):.1f}</b></td>
                 <td>{row['confidence']}</td>
                 <td>{validation_badge(row['validation'])}</td>
                 <td><b>{row['trade_grade']}</b></td>
@@ -3710,7 +4010,7 @@ def encode_entry_timing(value):
 
 
 def build_ml_dataset():
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect()
     cursor = conn.cursor()
 
     cursor.execute("""
@@ -3841,7 +4141,7 @@ def features_from_live_setup(setup):
 
 
 def ensure_ml_predictions_table():
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect()
     cursor = conn.cursor()
 
     cursor.execute("""
@@ -3887,7 +4187,7 @@ def save_ml_prediction(row):
     if not raw_trade_id:
         return
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect()
     cursor = conn.cursor()
 
     cursor.execute("""
@@ -3947,7 +4247,7 @@ def save_ml_prediction(row):
 def resolve_ml_predictions():
     ensure_ml_predictions_table()
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect()
     cursor = conn.cursor()
 
     cursor.execute("""
@@ -4000,7 +4300,7 @@ def get_ml_prediction_group_stats(group_field):
     ensure_ml_predictions_table()
     resolve_ml_predictions()
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect()
     cursor = conn.cursor()
 
     cursor.execute("""
@@ -4107,7 +4407,7 @@ def get_recent_ml_predictions(limit=50):
     ensure_ml_predictions_table()
     resolve_ml_predictions()
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect()
     cursor = conn.cursor()
 
     cursor.execute("""
@@ -4242,11 +4542,15 @@ def run_xgboost_shadow_model():
         roi_component = max(0, min(100, expected_roi * 3))
         historical_roi_component = max(0, min(100, historical_roi * 3))
 
+        pattern_component = float(setup.get("historical_pattern_score") or 50)
+
+        # ML is confirmation, not the main decision engine.
         final_score = (
-            0.35 * float(setup.get("live_score") or 0)
-            + 0.35 * ml_win_probability
+            0.45 * float(setup.get("live_score") or 0)
+            + 0.20 * ml_win_probability
             + 0.15 * roi_component
-            + 0.15 * historical_roi_component
+            + 0.10 * historical_roi_component
+            + 0.10 * pattern_component
         )
 
         combined_score = final_score
@@ -4266,13 +4570,12 @@ def run_xgboost_shadow_model():
             setup.get("action") == "BUY"
             and ml_win_probability >= 70
             and final_score >= 78
-            and expected_roi > 8
+            and expected_roi > 3
         ):
             ml_action = "ML CONFIRMED BUY"
         elif (
-            setup.get("action") in ["BUY", "WATCH"]
-            and ml_win_probability >= 60
-            and final_score >= 68
+            setup.get("action") == "BUY"
+            and final_score >= 70
         ):
             ml_action = "ML WATCH"
         else:
