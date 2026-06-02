@@ -2013,12 +2013,7 @@ def decide_trade_action(live_score, expected_roi, confidence, validation, histor
     expected_roi = float(expected_roi or 0)
     historical_count = int(historical_count or 0)
 
-    # Avoid BUY on ultra-low-upside markets unless score is exceptional.
-    if price_risk == "LOW UPSIDE" and live_score < 88:
-        if live_score >= 74 and expected_roi >= 1.5:
-            return "WATCH"
-        return "SKIP"
-
+    # BUY remains strict.
     if (
         live_score >= 82
         and expected_roi >= 4
@@ -2029,6 +2024,35 @@ def decide_trade_action(live_score, expected_roi, confidence, validation, histor
     ):
         return "BUY"
 
+    # Low-upside trades can be WATCH, but not BUY unless exceptional.
+    if price_risk == "LOW UPSIDE":
+        if live_score >= 74 and expected_roi >= 1.5 and validation in ["VALIDATED", "PROMISING"]:
+            return "WATCH"
+        return "SKIP"
+
+    # High-payout / asymmetric trades should not be skipped too aggressively.
+    # This fixes good setups with HIGH UPSIDE/BALANCED payout but live_score just below 70.
+    if (
+        price_risk in ["HIGH UPSIDE", "BALANCED"]
+        and live_score >= 64
+        and expected_roi >= 4
+        and validation in ["VALIDATED", "PROMISING"]
+        and confidence in ["🟢 HIGH", "🟡 MEDIUM", "🟠 LOW"]
+        and historical_count >= 20
+    ):
+        return "WATCH"
+
+    # Controlled payout trades need slightly stronger score.
+    if (
+        price_risk == "CONTROLLED"
+        and live_score >= 68
+        and expected_roi >= 3
+        and validation in ["VALIDATED", "PROMISING"]
+        and historical_count >= 20
+    ):
+        return "WATCH"
+
+    # Standard WATCH rule.
     if (
         live_score >= 70
         and expected_roi >= 2
