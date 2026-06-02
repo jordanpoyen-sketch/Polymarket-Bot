@@ -3214,9 +3214,11 @@ def get_resolution_sniper_opportunities():
     btc_price = get_btc_price()
 
     market_rows = get_active_btc_gamma_markets(500)
+    print("SNIPER DEBUG - gamma BTC markets:", len(market_rows))
 
     if not market_rows:
         market_rows = get_raw_trade_btc_markets_for_sniper()
+    print("SNIPER DEBUG - final market rows:", len(market_rows))
 
     opportunities = []
     seen = set()
@@ -3327,6 +3329,8 @@ def get_resolution_sniper_opportunities():
         ),
         reverse=True
     )
+
+    print("SNIPER DEBUG - opportunities:", len(opportunities))
 
     return opportunities[:100]
 
