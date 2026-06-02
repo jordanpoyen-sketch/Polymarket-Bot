@@ -2934,6 +2934,7 @@ def get_logical_arbitrage_opportunities():
         reverse=True
     )
 
+    print("SNIPER DEBUG - opportunities:", len(opportunities))
     return opportunities[:100]
 
 
@@ -3073,75 +3074,134 @@ def calculate_sniper_score(distance_pct, minutes_left, live_price, quality, prob
 
 
 def get_active_btc_gamma_markets(limit=500):
-    try:
-        url = "https://gamma-api.polymarket.com/markets"
-        params = {
-            "closed": "false",
-            "active": "true",
-            "limit": limit
-        }
+    """
+    Broader Gamma scanner for Resolution Sniper.
+    The previous version only queried /markets once and found too few BTC markets.
+    This version tries multiple search queries and offsets, then deduplicates by slug/outcome.
+    """
+    result = []
+    seen = set()
 
-        response = requests.get(url, params=params, timeout=25)
+    queries = ["bitcoin", "btc"]
 
-        if response.status_code != 200:
-            print("Erreur gamma active markets :", response.text[:300])
-            return []
+    endpoints_to_try = [
+        "https://gamma-api.polymarket.com/markets"
+    ]
 
-        data = response.json()
-
-        if isinstance(data, dict):
-            markets = data.get("markets") or data.get("data") or []
-        else:
-            markets = data
-
-        result = []
-
-        for market in markets:
-            title = market.get("question") or market.get("title") or market.get("name") or ""
-            slug = market.get("slug") or ""
-
-            if "bitcoin" not in title.lower() and "btc" not in title.lower():
-                continue
-
-            outcomes_raw = market.get("outcomes")
-            prices_raw = market.get("outcomePrices")
-
-            try:
-                outcomes = json.loads(outcomes_raw) if isinstance(outcomes_raw, str) else outcomes_raw
-                prices = json.loads(prices_raw) if isinstance(prices_raw, str) else prices_raw
-            except Exception:
-                outcomes = None
-                prices = None
-
-            if not outcomes or not prices:
-                continue
-
-            for idx, outcome in enumerate(outcomes):
+    for endpoint in endpoints_to_try:
+        for query in queries:
+            for offset in range(0, 1000, 100):
                 try:
-                    price = float(prices[idx])
-                except Exception:
+                    params_variants = [
+                        {
+                            "closed": "false",
+                            "active": "true",
+                            "limit": 100,
+                            "offset": offset,
+                            "q": query
+                        },
+                        {
+                            "closed": "false",
+                            "active": "true",
+                            "limit": 100,
+                            "offset": offset,
+                            "search": query
+                        },
+                        {
+                            "closed": "false",
+                            "active": "true",
+                            "limit": 100,
+                            "offset": offset
+                        }
+                    ]
+
+                    for params in params_variants:
+                        response = requests.get(endpoint, params=params, timeout=25)
+
+                        if response.status_code != 200:
+                            continue
+
+                        data = response.json()
+
+                        if isinstance(data, dict):
+                            markets = (
+                                data.get("markets")
+                                or data.get("data")
+                                or data.get("results")
+                                or []
+                            )
+                        else:
+                            markets = data
+
+                        if not markets:
+                            continue
+
+                        for market in markets:
+                            title = (
+                                market.get("question")
+                                or market.get("title")
+                                or market.get("name")
+                                or ""
+                            )
+                            slug = market.get("slug") or ""
+
+                            text = f"{title} {slug}".lower()
+
+                            if "bitcoin" not in text and "btc" not in text:
+                                continue
+
+                            outcomes_raw = market.get("outcomes")
+                            prices_raw = market.get("outcomePrices")
+
+                            try:
+                                outcomes = json.loads(outcomes_raw) if isinstance(outcomes_raw, str) else outcomes_raw
+                                prices = json.loads(prices_raw) if isinstance(prices_raw, str) else prices_raw
+                            except Exception:
+                                outcomes = None
+                                prices = None
+
+                            if not outcomes or not prices:
+                                continue
+
+                            for idx, outcome in enumerate(outcomes):
+                                try:
+                                    price = float(prices[idx])
+                                except Exception:
+                                    continue
+
+                                dedupe_key = (slug, str(outcome).lower())
+
+                                if dedupe_key in seen:
+                                    continue
+
+                                seen.add(dedupe_key)
+
+                                result.append({
+                                    "id": market.get("id") or slug,
+                                    "date_detected": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                    "title": title,
+                                    "slug": slug,
+                                    "outcome": str(outcome),
+                                    "price": price,
+                                    "market_type": classify_market(title),
+                                    "quality_signal": 1 if is_quality_signal(title, str(outcome)) else 0,
+                                    "reinforcement_count": 1,
+                                    "cumulative_size": 0,
+                                    "probability_score": 50,
+                                    "trade_grade": "LIVE"
+                                })
+
+                    # Stop if enough markets collected.
+                    if len(result) >= limit:
+                        print("SNIPER DEBUG - broad gamma BTC markets:", len(result))
+                        return result[:limit]
+
+                except Exception as e:
+                    print("Erreur get_active_btc_gamma_markets offset/query :", query, offset, e)
                     continue
 
-                result.append({
-                    "id": market.get("id") or slug,
-                    "date_detected": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "title": title,
-                    "slug": slug,
-                    "outcome": str(outcome),
-                    "price": price,
-                    "market_type": classify_market(title),
-                    "quality_signal": 1 if is_quality_signal(title, str(outcome)) else 0,
-                    "reinforcement_count": 1,
-                    "cumulative_size": 0,
-                    "probability_score": 50,
-                    "trade_grade": "LIVE"
-                })
-
-        return result
-
-    except Exception as e:
-        print("Erreur get_active_btc_gamma_markets :", e)
-        return []
+    print("SNIPER DEBUG - broad gamma BTC markets:", len(result))
+    return result[:limit]
 
 
 def get_raw_trade_btc_markets_for_sniper():
@@ -3330,8 +3390,6 @@ def get_resolution_sniper_opportunities():
         reverse=True
     )
 
-    print("SNIPER DEBUG - opportunities:", len(opportunities))
-
     return opportunities[:100]
 
 
@@ -3454,6 +3512,7 @@ def html_header(title):
             <a href="/paper">Paper Trades</a>
             <a href="/logical-arb">Logical Arb</a>
             <a href="/resolution-sniper">Resolution Sniper</a>
+            <a href="/sniper-debug">Sniper Debug</a>
         </div>
     """
 
@@ -5100,7 +5159,7 @@ def resolution_sniper_dashboard():
             <h2>Objectif</h2>
             <p>Détecter les marchés BTC proches de l'expiration où le résultat semble presque verrouillé mais le prix n'est pas encore à 0.99.</p>
             <p class="small">
-                Filtres V1 : BTC uniquement, expiration &lt; 60 min, distance au seuil &gt; 1%, prix live &lt; 0.97.
+                Filtres V1 corrigés : BTC uniquement, expiration &lt; 60 min, distance au seuil &gt; 0.35%, prix live &lt; 0.97.
             </p>
         </div>
     """
@@ -5176,6 +5235,152 @@ def resolution_sniper_dashboard():
                 À utiliser uniquement comme signal supplémentaire.
                 Priorité réelle : SNIPER BUY + ML CONFIRMED BUY + VALIDATED/HIGH quand les signaux convergent.
             </p>
+        </div>
+    """
+
+    html += html_footer()
+    return html
+
+
+
+@app.get("/sniper-debug", response_class=HTMLResponse)
+def sniper_debug_dashboard():
+    init_db()
+    backfill_clean_fields()
+
+    btc_price = get_btc_price()
+    gamma_rows = get_active_btc_gamma_markets(500)
+    fallback_rows = []
+
+    if not gamma_rows:
+        fallback_rows = get_raw_trade_btc_markets_for_sniper()
+
+    rows = gamma_rows if gamma_rows else fallback_rows
+
+    total_rows = len(rows)
+    with_threshold = 0
+    with_expiry = 0
+    under_60 = 0
+    under_60_and_distance = 0
+    under_60_distance_price = 0
+    samples = []
+
+    for row in rows:
+        title = row.get("title")
+        slug = row.get("slug")
+        outcome = row.get("outcome")
+        price = float(row.get("price") or 0)
+        market_type = row.get("market_type") or classify_market(title)
+        threshold = extract_btc_threshold(title)
+        minutes_left = minutes_until_market_expiry(slug)
+
+        distance_pct = None
+        favorable = False
+
+        if threshold:
+            with_threshold += 1
+            distance_pct, favorable = calculate_sniper_distance(
+                market_type,
+                outcome,
+                btc_price,
+                threshold
+            )
+
+        if minutes_left is not None:
+            with_expiry += 1
+
+        if minutes_left is not None and 0 < minutes_left <= 60:
+            under_60 += 1
+
+            if distance_pct is not None and distance_pct >= 0.35 and favorable:
+                under_60_and_distance += 1
+
+                if price < 0.97:
+                    under_60_distance_price += 1
+
+        if len(samples) < 40:
+            samples.append({
+                "title": title,
+                "outcome": outcome,
+                "price": price,
+                "market_type": market_type,
+                "threshold": threshold,
+                "minutes_left": minutes_left,
+                "distance_pct": distance_pct,
+                "favorable": favorable,
+                "slug": slug
+            })
+
+    html = html_header("Sniper Debug")
+
+    html += """
+        <h1>🧪 Sniper Debug</h1>
+        <div class="section">
+            <h2>Objectif</h2>
+            <p>Comprendre pourquoi Resolution Sniper retourne 0 opportunité.</p>
+        </div>
+    """
+
+    html += f"""
+        <div class="grid">
+            {render_kpi("BTC Live", f"{btc_price:.2f}")}
+            {render_kpi("Gamma BTC rows", len(gamma_rows))}
+            {render_kpi("Fallback raw rows", len(fallback_rows))}
+            {render_kpi("Rows analysées", total_rows)}
+            {render_kpi("Avec seuil", with_threshold)}
+            {render_kpi("Avec expiration", with_expiry)}
+            {render_kpi("Expiration <60min", under_60)}
+            {render_kpi("<60min + distance OK", under_60_and_distance)}
+            {render_kpi("Candidats finaux avant score", under_60_distance_price)}
+        </div>
+    """
+
+    html += """
+        <div class="section">
+            <h2>Échantillon marchés analysés</h2>
+            <table>
+                <tr>
+                    <th>Market</th>
+                    <th>Outcome</th>
+                    <th>Prix</th>
+                    <th>Type</th>
+                    <th>Seuil</th>
+                    <th>Temps restant</th>
+                    <th>Distance</th>
+                    <th>Favorable</th>
+                    <th>Slug</th>
+                </tr>
+    """
+
+    if not samples:
+        html += """
+                <tr>
+                    <td colspan="9">Aucun marché analysé.</td>
+                </tr>
+        """
+
+    for s in samples:
+        minutes = "-" if s["minutes_left"] is None else f"{s['minutes_left']:.1f} min"
+        distance = "-" if s["distance_pct"] is None else f"{s['distance_pct']:.2f}%"
+        threshold = "-" if s["threshold"] is None else f"{s['threshold']:.2f}"
+        favorable = "✅" if s["favorable"] else "❌"
+
+        html += f"""
+                <tr>
+                    <td>{s['title']}</td>
+                    <td>{s['outcome']}</td>
+                    <td>{s['price']:.3f}</td>
+                    <td>{s['market_type']}</td>
+                    <td>{threshold}</td>
+                    <td>{minutes}</td>
+                    <td>{distance}</td>
+                    <td>{favorable}</td>
+                    <td>{s['slug']}</td>
+                </tr>
+        """
+
+    html += """
+            </table>
         </div>
     """
 
