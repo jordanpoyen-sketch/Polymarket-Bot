@@ -96,6 +96,31 @@ def init_db():
         )
     """)
 
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS btc_scanner_trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            date_opened TEXT,
+            slug TEXT,
+            title TEXT,
+            outcome TEXT,
+            entry_price REAL,
+            btc_live REAL,
+            btc_trend TEXT,
+            rsi REAL,
+            volume_signal TEXT,
+            fear_greed INTEGER,
+            distance_pct REAL,
+            minutes_left REAL,
+            scanner_score REAL,
+            trade_size REAL,
+            shares REAL,
+            status TEXT,
+            result TEXT,
+            pnl REAL,
+            resolved_at TEXT
+        )
+    """)
+
     cursor.execute("PRAGMA table_info(raw_trades)")
     raw_columns = [col[1] for col in cursor.fetchall()]
 
@@ -1434,6 +1459,10 @@ def whale_tracker_loop():
             backfill_clean_fields()
             resolve_raw_trades()
             resolve_paper_trades()
+            resolve_btc_scanner_trades()
+            scanner_result = run_btc_autonomous_scanner()
+            print("BTC SCANNER - marchés scannés :", scanner_result.get("markets_scanned"))
+            print("BTC SCANNER - paper trades ouverts :", scanner_result.get("opened"))
 
             latest_edge_signals = []
 
@@ -3496,6 +3525,400 @@ def get_resolution_sniper_opportunities():
     return opportunities[:100]
 
 
+
+# --------------------------
+# AUTONOMOUS BTC SCANNER ENGINE
+# --------------------------
+
+def safe_float(value, default=0):
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def get_btc_candles_granularity(granularity=900, limit=100):
+    try:
+        url = "https://api.exchange.coinbase.com/products/BTC-USD/candles"
+        response = requests.get(url, params={"granularity": granularity}, timeout=20)
+        if response.status_code != 200:
+            return []
+        data = response.json()
+        if not isinstance(data, list):
+            return []
+        candles = data[:limit]
+        return sorted(candles, key=lambda x: x[0])
+    except Exception as e:
+        print("Erreur candles Coinbase :", e)
+        return []
+
+
+def calculate_rsi_from_closes(closes, period=14):
+    if not closes or len(closes) <= period:
+        return 50
+    gains, losses = [], []
+    for i in range(1, period + 1):
+        diff = closes[-i] - closes[-i - 1]
+        gains.append(max(diff, 0))
+        losses.append(abs(min(diff, 0)))
+    avg_gain = sum(gains) / period
+    avg_loss = sum(losses) / period
+    if avg_loss == 0:
+        return 100
+    rs = avg_gain / avg_loss
+    return round(100 - (100 / (1 + rs)), 2)
+
+
+def get_fear_and_greed_index():
+    try:
+        response = requests.get("https://api.alternative.me/fng/", params={"limit": 1, "format": "json"}, timeout=15)
+        if response.status_code != 200:
+            return None
+        items = response.json().get("data", [])
+        if not items:
+            return None
+        return int(items[0].get("value"))
+    except Exception as e:
+        print("Erreur Fear & Greed :", e)
+        return None
+
+
+def get_btc_market_context():
+    candles_15m = get_btc_candles_granularity(900, 100)
+    candles_1h = get_btc_candles_granularity(3600, 100)
+
+    btc_live = get_btc_price()
+    closes_15m = [safe_float(c[4]) for c in candles_15m]
+    closes_1h = [safe_float(c[4]) for c in candles_1h]
+
+    rsi_15m = calculate_rsi_from_closes(closes_15m, 14)
+    rsi_1h = calculate_rsi_from_closes(closes_1h, 14)
+
+    trend_15m = "NEUTRAL"
+    trend_1h = "NEUTRAL"
+
+    if len(closes_15m) >= 20:
+        ma_fast = sum(closes_15m[-5:]) / 5
+        ma_slow = sum(closes_15m[-20:]) / 20
+        if ma_fast > ma_slow * 1.001:
+            trend_15m = "BULLISH"
+        elif ma_fast < ma_slow * 0.999:
+            trend_15m = "BEARISH"
+
+    if len(closes_1h) >= 20:
+        ma_fast = sum(closes_1h[-5:]) / 5
+        ma_slow = sum(closes_1h[-20:]) / 20
+        if ma_fast > ma_slow * 1.001:
+            trend_1h = "BULLISH"
+        elif ma_fast < ma_slow * 0.999:
+            trend_1h = "BEARISH"
+
+    volume_signal = "NORMAL"
+    try:
+        volumes = [safe_float(c[5]) for c in candles_15m]
+        if len(volumes) >= 20:
+            current_volume = volumes[-1]
+            avg_volume = sum(volumes[-20:]) / 20
+            if avg_volume > 0 and current_volume > avg_volume * 1.8:
+                volume_signal = "HIGH"
+            elif avg_volume > 0 and current_volume < avg_volume * 0.60:
+                volume_signal = "LOW"
+    except Exception:
+        volume_signal = "UNKNOWN"
+
+    return {
+        "btc_live": btc_live,
+        "trend_15m": trend_15m,
+        "trend_1h": trend_1h,
+        "rsi_15m": rsi_15m,
+        "rsi_1h": rsi_1h,
+        "volume_signal": volume_signal,
+        "fear_greed": get_fear_and_greed_index()
+    }
+
+
+def get_short_btc_markets_from_raw_and_gamma():
+    markets = []
+    try:
+        markets.extend(get_active_btc_gamma_markets(500))
+    except Exception as e:
+        print("Erreur scanner gamma BTC :", e)
+    try:
+        markets.extend(get_raw_trade_btc_markets_for_sniper())
+    except Exception as e:
+        print("Erreur scanner raw BTC :", e)
+
+    final, seen = [], set()
+    for row in markets:
+        slug = row.get("slug")
+        outcome = row.get("outcome")
+        title = row.get("title") or ""
+        key = (slug, outcome)
+        if not slug or key in seen:
+            continue
+        seen.add(key)
+        if "bitcoin" not in title.lower() and "btc" not in title.lower():
+            continue
+        final.append(row)
+    return final
+
+
+def calculate_btc_scanner_side_score(market_type, outcome, btc_live, threshold, price, minutes_left, context):
+    if not threshold or not btc_live or price <= 0 or price >= 1:
+        return 0, "INVALID"
+
+    distance_pct, _ = calculate_sniper_distance(market_type, outcome, btc_live, threshold)
+    if distance_pct is None:
+        return 0, "INVALID"
+
+    payout_roi = ((1 - price) / price) * 100
+    trend_15m = context.get("trend_15m")
+    trend_1h = context.get("trend_1h")
+    rsi_15m = safe_float(context.get("rsi_15m"), 50)
+    volume_signal = context.get("volume_signal")
+    fear_greed = context.get("fear_greed")
+
+    score = 50
+    reasons = []
+
+    if distance_pct >= 5:
+        score += 18; reasons.append("distance forte")
+    elif distance_pct >= 3:
+        score += 14; reasons.append("distance correcte")
+    elif distance_pct >= 1:
+        score += 8; reasons.append("distance faible")
+    else:
+        score -= 12; reasons.append("trop proche du seuil")
+
+    if minutes_left is not None:
+        if 0 < minutes_left <= 60:
+            score += 14; reasons.append("expiration proche")
+        elif minutes_left <= 360:
+            score += 8; reasons.append("expiration <6h")
+        elif minutes_left <= 1440:
+            score += 4; reasons.append("expiration <24h")
+        else:
+            score -= 6; reasons.append("expiration lointaine")
+
+    if payout_roi >= 80:
+        score += 12; reasons.append("fort payout")
+    elif payout_roi >= 25:
+        score += 8; reasons.append("payout intéressant")
+    elif payout_roi < 5:
+        score -= 18; reasons.append("upside trop faible")
+
+    wants_up = (
+        (market_type == "Above" and outcome == "Yes") or
+        (market_type == "Below" and outcome == "No") or
+        (market_type == "Dip" and outcome == "No") or
+        (market_type == "Reach" and outcome == "Yes")
+    )
+    wants_down = (
+        (market_type == "Above" and outcome == "No") or
+        (market_type == "Below" and outcome == "Yes") or
+        (market_type == "Dip" and outcome == "Yes") or
+        (market_type == "Reach" and outcome == "No")
+    )
+
+    if wants_up:
+        if trend_15m == "BULLISH" and trend_1h in ["BULLISH", "NEUTRAL"]:
+            score += 14; reasons.append("tendance haussière favorable")
+        elif trend_15m == "BEARISH" and trend_1h == "BEARISH":
+            score -= 24; reasons.append("contre tendance baissière")
+        if rsi_15m >= 75:
+            score -= 8; reasons.append("RSI suracheté")
+        elif rsi_15m <= 35:
+            score += 4; reasons.append("RSI bas possible rebond")
+
+    if wants_down:
+        if trend_15m == "BEARISH" and trend_1h in ["BEARISH", "NEUTRAL"]:
+            score += 14; reasons.append("tendance baissière favorable")
+        elif trend_15m == "BULLISH" and trend_1h == "BULLISH":
+            score -= 24; reasons.append("contre tendance haussière")
+        if rsi_15m <= 25:
+            score -= 8; reasons.append("RSI survendu")
+        elif rsi_15m >= 65:
+            score += 4; reasons.append("RSI haut possible rejet")
+
+    if volume_signal == "HIGH":
+        if (wants_up and trend_15m == "BULLISH") or (wants_down and trend_15m == "BEARISH"):
+            score += 8; reasons.append("volume confirme")
+        else:
+            score -= 4; reasons.append("volume contre signal")
+
+    if fear_greed is not None:
+        if fear_greed >= 75 and wants_up:
+            score -= 4; reasons.append("greed élevé prudence long")
+        elif fear_greed <= 25 and wants_down:
+            score -= 4; reasons.append("fear élevé prudence short")
+        elif fear_greed >= 75 and wants_down:
+            score += 3; reasons.append("greed élevé contrarian")
+        elif fear_greed <= 25 and wants_up:
+            score += 3; reasons.append("fear élevé rebond")
+
+    if market_type == "Dip" and outcome == "Yes" and trend_15m == "BULLISH" and trend_1h == "BULLISH":
+        score -= 35; reasons.append("bloqué : dip yes pendant pump")
+    if market_type == "Above" and outcome == "No" and trend_15m == "BULLISH" and trend_1h == "BULLISH":
+        score -= 25; reasons.append("prudence : no above pendant pump")
+
+    return max(0, min(100, score)), " | ".join(reasons)
+
+
+def btc_scanner_trade_exists(slug, outcome):
+    conn = db_connect()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT COUNT(*) FROM btc_scanner_trades
+        WHERE slug = ? AND outcome = ? AND status = 'OPEN'
+    """, (slug, outcome))
+    exists = cursor.fetchone()[0] > 0
+    conn.close()
+    return exists
+
+
+def save_btc_scanner_trade(row, context, score, minutes_left, distance_pct):
+    slug = row.get("slug")
+    title = row.get("title")
+    outcome = row.get("outcome")
+    if btc_scanner_trade_exists(slug, outcome):
+        return False
+
+    price = get_live_outcome_price(slug, outcome)
+    if price is None:
+        price = safe_float(row.get("price"))
+    if price <= 0 or price >= 1:
+        return False
+
+    shares = PAPER_TRADE_SIZE / price
+    conn = db_connect()
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO btc_scanner_trades (
+            date_opened, slug, title, outcome, entry_price, btc_live, btc_trend, rsi,
+            volume_signal, fear_greed, distance_pct, minutes_left, scanner_score,
+            trade_size, shares, status, result, pnl, resolved_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        slug, title, outcome, price, context.get("btc_live"),
+        f"{context.get('trend_15m')}/{context.get('trend_1h')}",
+        context.get("rsi_15m"), context.get("volume_signal"), context.get("fear_greed"),
+        distance_pct, minutes_left, score, PAPER_TRADE_SIZE, shares, "OPEN", "", None, None
+    ))
+    conn.commit()
+    conn.close()
+    return True
+
+
+def run_btc_autonomous_scanner():
+    context = get_btc_market_context()
+    markets = get_short_btc_markets_from_raw_and_gamma()
+    opened = 0
+    candidates = []
+
+    for row in markets:
+        title = row.get("title")
+        slug = row.get("slug")
+        outcome = row.get("outcome")
+        market_type = row.get("market_type") or classify_market(title)
+        threshold = extract_btc_threshold(title)
+        if not threshold or threshold < 40000 or threshold > 200000:
+            continue
+
+        minutes_left = minutes_until_market_expiry(slug)
+        if minutes_left is None or minutes_left <= 0 or minutes_left > 1440:
+            continue
+
+        price = get_live_outcome_price(slug, outcome)
+        if price is None:
+            price = safe_float(row.get("price"))
+        if price <= 0.03 or price >= 0.98:
+            continue
+
+        distance_pct, _ = calculate_sniper_distance(market_type, outcome, context.get("btc_live"), threshold)
+        if distance_pct is None:
+            continue
+
+        score, reasons = calculate_btc_scanner_side_score(
+            market_type, outcome, context.get("btc_live"), threshold, price, minutes_left, context
+        )
+
+        candidates.append({
+            "title": title, "slug": slug, "outcome": outcome, "price": price,
+            "market_type": market_type, "threshold": threshold,
+            "minutes_left": minutes_left, "distance_pct": distance_pct,
+            "score": score, "reasons": reasons
+        })
+
+        if score >= 86:
+            if save_btc_scanner_trade(row, context, score, minutes_left, distance_pct):
+                opened += 1
+
+    candidates = sorted(candidates, key=lambda x: x["score"], reverse=True)
+    return {"context": context, "markets_scanned": len(markets), "candidates": candidates[:50], "opened": opened}
+
+
+def resolve_btc_scanner_trades():
+    conn = db_connect()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT id, slug, outcome, shares, trade_size, title
+        FROM btc_scanner_trades
+        WHERE status = 'OPEN'
+    """)
+    rows = cursor.fetchall()
+
+    for trade_id, slug, outcome, shares, trade_size, title in rows:
+        market = get_market_data(slug)
+        if not market or not market.get("closed"):
+            continue
+        winning_outcome = extract_winning_outcome(market)
+        if not winning_outcome:
+            continue
+        if winning_outcome == outcome:
+            result = "WIN"
+            pnl = round(float(shares) - float(trade_size), 2)
+        else:
+            result = "LOSS"
+            pnl = -float(trade_size)
+        cursor.execute("""
+            UPDATE btc_scanner_trades
+            SET status='CLOSED', result=?, pnl=?, resolved_at=?
+            WHERE id=?
+        """, (result, pnl, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), trade_id))
+        print(f"✅ BTC SCANNER résolu : {result} | PnL {pnl} | {title}")
+
+    conn.commit()
+    conn.close()
+
+
+def get_btc_scanner_stats():
+    conn = db_connect()
+    cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(*) FROM btc_scanner_trades")
+    total = cursor.fetchone()[0]
+    cursor.execute("SELECT COUNT(*) FROM btc_scanner_trades WHERE status='OPEN'")
+    open_count = cursor.fetchone()[0]
+    cursor.execute("SELECT COUNT(*) FROM btc_scanner_trades WHERE status='CLOSED'")
+    closed = cursor.fetchone()[0]
+    cursor.execute("SELECT COUNT(*) FROM btc_scanner_trades WHERE result='WIN'")
+    wins = cursor.fetchone()[0]
+    cursor.execute("SELECT COUNT(*) FROM btc_scanner_trades WHERE result='LOSS'")
+    losses = cursor.fetchone()[0]
+    cursor.execute("SELECT COALESCE(SUM(pnl),0) FROM btc_scanner_trades WHERE status='CLOSED'")
+    pnl = cursor.fetchone()[0]
+    winrate = wins / closed * 100 if closed else 0
+    cursor.execute("""
+        SELECT date_opened,title,outcome,entry_price,btc_live,btc_trend,rsi,volume_signal,
+               fear_greed,distance_pct,minutes_left,scanner_score,status,result,pnl
+        FROM btc_scanner_trades ORDER BY id DESC LIMIT 100
+    """)
+    recent = cursor.fetchall()
+    conn.close()
+    return {"total": total, "open": open_count, "closed": closed, "wins": wins, "losses": losses, "pnl": pnl, "winrate": winrate, "recent": recent}
+
+
 # --------------------------
 # UI HELPERS
 # --------------------------
@@ -3616,6 +4039,7 @@ def html_header(title):
             <a href="/logical-arb">Logical Arb</a>
             <a href="/resolution-sniper">Resolution Sniper</a>
             <a href="/sniper-debug">Sniper Debug</a>
+            <a href="/btc-scanner">BTC Scanner</a>
         </div>
     """
 
@@ -5491,6 +5915,114 @@ def sniper_debug_dashboard():
         </div>
     """
 
+    html += html_footer()
+    return html
+
+
+
+
+@app.get("/btc-scanner", response_class=HTMLResponse)
+def btc_scanner_dashboard():
+    init_db()
+    backfill_clean_fields()
+
+    result = run_btc_autonomous_scanner()
+    stats = get_btc_scanner_stats()
+    context = result["context"]
+    candidates = result["candidates"]
+
+    html = html_header("BTC Autonomous Scanner")
+
+    html += """
+        <h1>🤖 BTC Autonomous Scanner</h1>
+        <div class="section">
+            <h2>Objectif</h2>
+            <p>Scanner automatiquement les marchés BTC, sans dépendre du wallet suivi.</p>
+            <p class="small">
+                Paper mode uniquement. Le scanner utilise BTC live, tendance 15m/1h, RSI, volume,
+                Fear & Greed, distance au seuil, temps restant et payout.
+            </p>
+        </div>
+    """
+
+    html += f"""
+        <div class="grid">
+            {render_kpi("BTC Live", f"{context.get("btc_live", 0):.2f}")}
+            {render_kpi("Trend 15m", context.get("trend_15m"))}
+            {render_kpi("Trend 1h", context.get("trend_1h"))}
+            {render_kpi("RSI 15m", context.get("rsi_15m"))}
+            {render_kpi("RSI 1h", context.get("rsi_1h"))}
+            {render_kpi("Volume", context.get("volume_signal"))}
+            {render_kpi("Fear & Greed", context.get("fear_greed") if context.get("fear_greed") is not None else "-")}
+            {render_kpi("Marchés scannés", result.get("markets_scanned"))}
+            {render_kpi("Ouverts ce scan", result.get("opened"))}
+            {render_kpi("Scanner total", stats["total"])}
+            {render_kpi("Scanner open", stats["open"])}
+            {render_kpi("Scanner closed", stats["closed"])}
+            {render_kpi("Scanner winrate", f"{stats["winrate"]:.2f}", "%")}
+            {render_kpi("Scanner PnL", f"{stats["pnl"]:.2f}", " USDC", roi_class(stats["pnl"]))}
+        </div>
+    """
+
+    html += """
+        <div class="section">
+            <h2>🔥 BTC Scanner Candidates</h2>
+            <table>
+                <tr>
+                    <th>Rank</th><th>Score</th><th>Market</th><th>Outcome</th><th>Prix live</th>
+                    <th>Type</th><th>Seuil</th><th>Distance</th><th>Temps restant</th><th>Raisons</th>
+                </tr>
+    """
+
+    if not candidates:
+        html += '<tr><td colspan="10">Aucun candidat détecté actuellement.</td></tr>'
+
+    for idx, row in enumerate(candidates, start=1):
+        html += f"""
+                <tr>
+                    <td>{idx}</td>
+                    <td><b>{row["score"]:.1f}</b></td>
+                    <td>{row["title"]}</td>
+                    <td><b>{row["outcome"]}</b></td>
+                    <td>{row["price"]:.3f}</td>
+                    <td>{row["market_type"]}</td>
+                    <td>{row["threshold"]:.2f}</td>
+                    <td>{row["distance_pct"]:.2f}%</td>
+                    <td>{row["minutes_left"]:.1f} min</td>
+                    <td class="small">{row["reasons"]}</td>
+                </tr>
+        """
+
+    html += "</table></div>"
+
+    html += """
+        <div class="section">
+            <h2>📄 BTC Scanner Paper Trades</h2>
+            <table>
+                <tr>
+                    <th>Date</th><th>Market</th><th>Outcome</th><th>Entry</th><th>BTC Open</th>
+                    <th>Trend</th><th>RSI</th><th>Volume</th><th>F&G</th><th>Distance</th>
+                    <th>Temps</th><th>Score</th><th>Status</th><th>Result</th><th>PnL</th>
+                </tr>
+    """
+
+    if not stats["recent"]:
+        html += '<tr><td colspan="15">Aucun paper trade scanner pour le moment.</td></tr>'
+
+    for row in stats["recent"]:
+        date_opened,title,outcome,entry_price,btc_live,btc_trend,rsi,volume_signal,fear_greed,distance_pct,minutes_left,scanner_score,status,result_value,pnl = row
+        html += f"""
+                <tr>
+                    <td>{date_opened}</td><td>{title}</td><td><b>{outcome}</b></td>
+                    <td>{float(entry_price or 0):.3f}</td><td>{float(btc_live or 0):.2f}</td>
+                    <td>{btc_trend}</td><td>{float(rsi or 0):.1f}</td><td>{volume_signal}</td>
+                    <td>{fear_greed}</td><td>{float(distance_pct or 0):.2f}%</td>
+                    <td>{float(minutes_left or 0):.1f} min</td><td><b>{float(scanner_score or 0):.1f}</b></td>
+                    <td>{status}</td><td>{result_value}</td><td class="{roi_class(pnl)}">{float(pnl or 0):.2f}</td>
+                </tr>
+        """
+
+    html += "</table></div>"
     html += html_footer()
     return html
 
