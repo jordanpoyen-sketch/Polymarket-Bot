@@ -3049,6 +3049,86 @@ def get_market_end_datetime(slug):
     return parse_iso_datetime(end_date)
 
 
+
+def get_btc_title_expiry_datetime(title):
+    """
+    Fallback for BTC daily Polymarket markets:
+    "Will the price of Bitcoin be above $68,000 on June 5?"
+    Resolution assumed at 18:00 Europe/Paris.
+    """
+    try:
+        import re
+        from zoneinfo import ZoneInfo
+
+        if not title:
+            return None
+
+        text = str(title)
+
+        match = re.search(
+            r"\bon\s+(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2})\b",
+            text,
+            re.IGNORECASE
+        )
+
+        if not match:
+            return None
+
+        month_name = match.group(1).lower()
+        day = int(match.group(2))
+
+        months = {
+            "january": 1,
+            "february": 2,
+            "march": 3,
+            "april": 4,
+            "may": 5,
+            "june": 6,
+            "july": 7,
+            "august": 8,
+            "september": 9,
+            "october": 10,
+            "november": 11,
+            "december": 12
+        }
+
+        month = months.get(month_name)
+
+        if not month:
+            return None
+
+        # Most markets in this bot are 2026. If current year changes, use current UTC year.
+        year = datetime.now(timezone.utc).year
+
+        paris_tz = ZoneInfo("Europe/Paris")
+        expiry_paris = datetime(year, month, day, 18, 0, 0, tzinfo=paris_tz)
+
+        # If this date is unrealistically far in the past because of year rollover, use next year.
+        now_utc = datetime.now(timezone.utc)
+        if (expiry_paris.astimezone(timezone.utc) - now_utc).days < -300:
+            expiry_paris = datetime(year + 1, month, day, 18, 0, 0, tzinfo=paris_tz)
+
+        return expiry_paris.astimezone(timezone.utc)
+
+    except Exception as e:
+        print("Erreur get_btc_title_expiry_datetime :", e)
+        return None
+
+
+def minutes_until_btc_market_expiry(slug, title=None):
+    """
+    Uses title-based expiry first for BTC daily markets, then Gamma endDate fallback.
+    """
+    title_expiry = get_btc_title_expiry_datetime(title)
+
+    if title_expiry:
+        diff = title_expiry - datetime.now(timezone.utc)
+        return round(diff.total_seconds() / 60, 2)
+
+    return minutes_until_market_expiry(slug)
+
+
+
 def minutes_until_market_expiry(slug):
     end_dt = get_market_end_datetime(slug)
 
@@ -3844,7 +3924,7 @@ def run_btc_autonomous_scanner():
             rejected["bad_threshold"] += 1
             continue
 
-        minutes_left = minutes_until_market_expiry(slug)
+        minutes_left = minutes_until_btc_market_expiry(slug, title)
 
         if minutes_left is None or minutes_left <= 0 or minutes_left > 1440:
             rejected["bad_expiry"] += 1
@@ -3933,35 +4013,103 @@ def run_btc_autonomous_scanner():
 def resolve_btc_scanner_trades():
     conn = db_connect()
     cursor = conn.cursor()
+
     cursor.execute("""
         SELECT id, slug, outcome, shares, trade_size, title
         FROM btc_scanner_trades
         WHERE status = 'OPEN'
     """)
+
     rows = cursor.fetchall()
 
     for trade_id, slug, outcome, shares, trade_size, title in rows:
+        result = None
+        pnl = None
+
         market = get_market_data(slug)
-        if not market or not market.get("closed"):
+
+        # Normal official resolution path.
+        if market and market.get("closed"):
+            winning_outcome = extract_winning_outcome(market)
+
+            if winning_outcome:
+                if winning_outcome == outcome:
+                    result = "WIN"
+                    pnl = round(float(shares) - float(trade_size), 2)
+                else:
+                    result = "LOSS"
+                    pnl = -float(trade_size)
+
+        # Fallback path:
+        # Some Gamma markets are effectively resolved while closed remains false.
+        # If title expiry has passed and live price is close to 0 or 1, close it.
+        if result is None:
+            minutes_left = minutes_until_btc_market_expiry(slug, title)
+            live_price = get_live_outcome_price(slug, outcome)
+
+            if minutes_left is not None and minutes_left <= 0 and live_price is not None:
+                live_price = float(live_price)
+
+                if live_price >= 0.95:
+                    result = "WIN"
+                    pnl = round(float(shares) - float(trade_size), 2)
+                    print(f"⚠️ BTC SCANNER fallback close via live price WIN : {live_price} | {title}")
+
+                elif live_price <= 0.05:
+                    result = "LOSS"
+                    pnl = -float(trade_size)
+                    print(f"⚠️ BTC SCANNER fallback close via live price LOSS : {live_price} | {title}")
+
+        # Last-resort fallback:
+        # If expiry is far passed and no price is available, infer simple Above/Below/Reach/Dip from current BTC.
+        # This is only used after 30 minutes past expiry to avoid premature closure.
+        if result is None:
+            minutes_left = minutes_until_btc_market_expiry(slug, title)
+
+            if minutes_left is not None and minutes_left <= -30:
+                btc_live = get_btc_price()
+                market_type = classify_market(title)
+                threshold = extract_btc_threshold(title)
+
+                if btc_live and threshold and market_type in ["Above", "Below", "Reach", "Dip"]:
+                    _, favorable = calculate_sniper_distance(
+                        market_type,
+                        outcome,
+                        btc_live,
+                        threshold
+                    )
+
+                    if favorable:
+                        result = "WIN"
+                        pnl = round(float(shares) - float(trade_size), 2)
+                    else:
+                        result = "LOSS"
+                        pnl = -float(trade_size)
+
+                    print(f"⚠️ BTC SCANNER last-resort close via BTC live : {result} | BTC {btc_live} | {title}")
+
+        if result is None:
             continue
-        winning_outcome = extract_winning_outcome(market)
-        if not winning_outcome:
-            continue
-        if winning_outcome == outcome:
-            result = "WIN"
-            pnl = round(float(shares) - float(trade_size), 2)
-        else:
-            result = "LOSS"
-            pnl = -float(trade_size)
+
         cursor.execute("""
             UPDATE btc_scanner_trades
-            SET status='CLOSED', result=?, pnl=?, resolved_at=?
-            WHERE id=?
-        """, (result, pnl, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), trade_id))
+            SET status = 'CLOSED',
+                result = ?,
+                pnl = ?,
+                resolved_at = ?
+            WHERE id = ?
+        """, (
+            result,
+            pnl,
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            trade_id
+        ))
+
         print(f"✅ BTC SCANNER résolu : {result} | PnL {pnl} | {title}")
 
     conn.commit()
     conn.close()
+
 
 
 def get_btc_scanner_stats():
