@@ -3814,8 +3814,20 @@ def save_btc_scanner_trade(row, context, score, minutes_left, distance_pct):
 def run_btc_autonomous_scanner():
     context = get_btc_market_context()
     markets = get_short_btc_markets_from_raw_and_gamma()
+
     opened = 0
     candidates = []
+    rejected = {
+        "total_markets": len(markets),
+        "missing_threshold": 0,
+        "bad_threshold": 0,
+        "bad_expiry": 0,
+        "bad_price": 0,
+        "bad_distance": 0,
+        "score_below_open": 0,
+        "already_open": 0,
+        "open_signal": 0
+    }
 
     for row in markets:
         title = row.get("title")
@@ -3823,40 +3835,99 @@ def run_btc_autonomous_scanner():
         outcome = row.get("outcome")
         market_type = row.get("market_type") or classify_market(title)
         threshold = extract_btc_threshold(title)
-        if not threshold or threshold < 40000 or threshold > 200000:
+
+        if not threshold:
+            rejected["missing_threshold"] += 1
+            continue
+
+        if threshold < 40000 or threshold > 200000:
+            rejected["bad_threshold"] += 1
             continue
 
         minutes_left = minutes_until_market_expiry(slug)
+
         if minutes_left is None or minutes_left <= 0 or minutes_left > 1440:
+            rejected["bad_expiry"] += 1
             continue
 
         price = get_live_outcome_price(slug, outcome)
+
         if price is None:
             price = safe_float(row.get("price"))
-        if price <= 0.03 or price >= 0.98:
+
+        if price <= 0 or price >= 1:
+            rejected["bad_price"] += 1
             continue
 
-        distance_pct, _ = calculate_sniper_distance(market_type, outcome, context.get("btc_live"), threshold)
+        distance_pct, _ = calculate_sniper_distance(
+            market_type,
+            outcome,
+            context.get("btc_live"),
+            threshold
+        )
+
         if distance_pct is None:
+            rejected["bad_distance"] += 1
             continue
 
         score, reasons = calculate_btc_scanner_side_score(
-            market_type, outcome, context.get("btc_live"), threshold, price, minutes_left, context
+            market_type,
+            outcome,
+            context.get("btc_live"),
+            threshold,
+            price,
+            minutes_left,
+            context
         )
 
+        open_status = "NO TRADE"
+
+        if score >= 86:
+            open_status = "OPEN SIGNAL"
+        elif score >= 75:
+            open_status = "NEAR SIGNAL"
+        elif score >= 60:
+            open_status = "WEAK WATCH"
+
+        already_open = btc_scanner_trade_exists(slug, outcome)
+
         candidates.append({
-            "title": title, "slug": slug, "outcome": outcome, "price": price,
-            "market_type": market_type, "threshold": threshold,
-            "minutes_left": minutes_left, "distance_pct": distance_pct,
-            "score": score, "reasons": reasons
+            "title": title,
+            "slug": slug,
+            "outcome": outcome,
+            "price": price,
+            "market_type": market_type,
+            "threshold": threshold,
+            "minutes_left": minutes_left,
+            "distance_pct": distance_pct,
+            "score": score,
+            "reasons": reasons,
+            "open_status": open_status,
+            "already_open": already_open
         })
 
         if score >= 86:
-            if save_btc_scanner_trade(row, context, score, minutes_left, distance_pct):
-                opened += 1
+            if already_open:
+                rejected["already_open"] += 1
+            else:
+                if save_btc_scanner_trade(row, context, score, minutes_left, distance_pct):
+                    opened += 1
+                    rejected["open_signal"] += 1
+        else:
+            rejected["score_below_open"] += 1
 
     candidates = sorted(candidates, key=lambda x: x["score"], reverse=True)
-    return {"context": context, "markets_scanned": len(markets), "candidates": candidates[:50], "opened": opened}
+
+    print("BTC SCANNER DEBUG :", rejected)
+
+    return {
+        "context": context,
+        "markets_scanned": len(markets),
+        "candidates": candidates[:50],
+        "opened": opened,
+        "rejected": rejected
+    }
+
 
 
 def resolve_btc_scanner_trades():
@@ -5930,6 +6001,7 @@ def btc_scanner_dashboard():
     stats = get_btc_scanner_stats()
     context = result["context"]
     candidates = result["candidates"]
+    rejected = result.get("rejected", {})
 
     html = html_header("BTC Autonomous Scanner")
 
@@ -5964,23 +6036,49 @@ def btc_scanner_dashboard():
         </div>
     """
 
+    html += f"""
+        <div class="section">
+            <h2>🧪 Scanner Debug</h2>
+            <div class="grid">
+                {render_kpi("Total marchés reçus", rejected.get("total_markets", 0))}
+                {render_kpi("Rejetés seuil manquant", rejected.get("missing_threshold", 0))}
+                {render_kpi("Rejetés seuil invalide", rejected.get("bad_threshold", 0))}
+                {render_kpi("Rejetés expiration", rejected.get("bad_expiry", 0))}
+                {render_kpi("Rejetés prix", rejected.get("bad_price", 0))}
+                {render_kpi("Rejetés distance", rejected.get("bad_distance", 0))}
+                {render_kpi("Score sous seuil", rejected.get("score_below_open", 0))}
+                {render_kpi("Déjà ouverts", rejected.get("already_open", 0))}
+                {render_kpi("Signaux ouverts", rejected.get("open_signal", 0))}
+            </div>
+        </div>
+    """
+
     html += """
         <div class="section">
             <h2>🔥 BTC Scanner Candidates</h2>
+            <p class="small">
+                Le tableau affiche maintenant les meilleurs candidats même si aucun paper trade n'est ouvert.
+                L'ouverture reste stricte : score >= 86 et pas déjà ouvert.
+            </p>
             <table>
                 <tr>
-                    <th>Rank</th><th>Score</th><th>Market</th><th>Outcome</th><th>Prix live</th>
+                    <th>Rank</th><th>Status</th><th>Score</th><th>Market</th><th>Outcome</th><th>Prix live</th>
                     <th>Type</th><th>Seuil</th><th>Distance</th><th>Temps restant</th><th>Raisons</th>
                 </tr>
     """
 
     if not candidates:
-        html += '<tr><td colspan="10">Aucun candidat détecté actuellement.</td></tr>'
+        html += '<tr><td colspan="11">Aucun candidat détecté actuellement.</td></tr>'
 
     for idx, row in enumerate(candidates, start=1):
+        status = row.get("open_status", "NO TRADE")
+        if row.get("already_open"):
+            status = status + " / DÉJÀ OUVERT"
+
         html += f"""
                 <tr>
                     <td>{idx}</td>
+                    <td><b>{status}</b></td>
                     <td><b>{row["score"]:.1f}</b></td>
                     <td>{row["title"]}</td>
                     <td><b>{row["outcome"]}</b></td>
