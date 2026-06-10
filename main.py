@@ -3718,29 +3718,176 @@ def get_btc_market_context():
 
 
 def get_short_btc_markets_from_raw_and_gamma():
+    """
+    Improved BTC market source for autonomous scanner.
+    Priority:
+    1. Gamma active markets with broader pagination and BTC keyword filtering.
+    2. Existing raw_trades fallback.
+    3. Keep only markets that look like BTC price prediction markets.
+    """
     markets = []
-    try:
-        markets.extend(get_active_btc_gamma_markets(500))
-    except Exception as e:
-        print("Erreur scanner gamma BTC :", e)
-    try:
-        markets.extend(get_raw_trade_btc_markets_for_sniper())
-    except Exception as e:
-        print("Erreur scanner raw BTC :", e)
+    seen = set()
 
-    final, seen = [], set()
-    for row in markets:
+    def add_market_row(row):
         slug = row.get("slug")
         outcome = row.get("outcome")
         title = row.get("title") or ""
         key = (slug, outcome)
-        if not slug or key in seen:
-            continue
+
+        if not slug or not outcome or key in seen:
+            return
+
+        text = f"{title} {slug}".lower()
+
+        if "bitcoin" not in text and "btc" not in text:
+            return
+
+        btc_price_keywords = [
+            "price of bitcoin",
+            "bitcoin be above",
+            "bitcoin be below",
+            "bitcoin be less",
+            "bitcoin be between",
+            "bitcoin dip",
+            "bitcoin reach",
+            "btc above",
+            "btc below",
+            "btc between"
+        ]
+
+        if not any(k in text for k in btc_price_keywords):
+            return
+
+        blocked = [
+            "before gta",
+            "before 2027",
+            "reserve",
+            "unban",
+            "$1m",
+            "$1 m",
+            "150k",
+            "million"
+        ]
+
+        if any(b in text for b in blocked):
+            return
+
         seen.add(key)
-        if "bitcoin" not in title.lower() and "btc" not in title.lower():
-            continue
-        final.append(row)
-    return final
+        markets.append(row)
+
+    # 1) Broad Gamma pagination.
+    try:
+        queries = [
+            "Bitcoin",
+            "BTC",
+            "price of Bitcoin",
+            "Bitcoin above",
+            "Bitcoin below",
+            "Bitcoin between",
+            "Bitcoin less",
+            "Bitcoin dip",
+            "Bitcoin reach"
+        ]
+
+        for query in queries:
+            for offset in range(0, 2000, 100):
+                params_variants = [
+                    {"closed": "false", "active": "true", "limit": 100, "offset": offset, "q": query},
+                    {"closed": "false", "active": "true", "limit": 100, "offset": offset, "search": query},
+                    {"closed": "false", "active": "true", "limit": 100, "offset": offset, "query": query},
+                    {"limit": 100, "offset": offset, "q": query},
+                    {"limit": 100, "offset": offset, "search": query},
+                ]
+
+                for params in params_variants:
+                    try:
+                        response = requests.get(
+                            "https://gamma-api.polymarket.com/markets",
+                            params=params,
+                            timeout=20
+                        )
+
+                        if response.status_code != 200:
+                            continue
+
+                        data = response.json()
+
+                        if isinstance(data, dict):
+                            gamma_markets = (
+                                data.get("markets")
+                                or data.get("data")
+                                or data.get("results")
+                                or []
+                            )
+                        else:
+                            gamma_markets = data
+
+                        if not gamma_markets:
+                            continue
+
+                        for market in gamma_markets:
+                            title = (
+                                market.get("question")
+                                or market.get("title")
+                                or market.get("name")
+                                or ""
+                            )
+                            slug = market.get("slug") or ""
+
+                            outcomes_raw = market.get("outcomes")
+                            prices_raw = market.get("outcomePrices")
+
+                            try:
+                                outcomes = json.loads(outcomes_raw) if isinstance(outcomes_raw, str) else outcomes_raw
+                                prices = json.loads(prices_raw) if isinstance(prices_raw, str) else prices_raw
+                            except Exception:
+                                outcomes = None
+                                prices = None
+
+                            if not outcomes or not prices:
+                                continue
+
+                            for idx, outcome in enumerate(outcomes):
+                                try:
+                                    price = float(prices[idx])
+                                except Exception:
+                                    continue
+
+                                add_market_row({
+                                    "id": market.get("id") or slug,
+                                    "date_detected": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                    "title": title,
+                                    "slug": slug,
+                                    "outcome": str(outcome),
+                                    "price": price,
+                                    "market_type": classify_market(title),
+                                    "quality_signal": 1 if is_quality_signal(title, str(outcome)) else 0,
+                                    "reinforcement_count": 1,
+                                    "cumulative_size": 0,
+                                    "probability_score": 50,
+                                    "trade_grade": "LIVE"
+                                })
+
+                    except Exception as e:
+                        print("Erreur Gamma variant BTC scanner :", e)
+                        continue
+
+                if len(markets) >= 300:
+                    break
+
+    except Exception as e:
+        print("Erreur scanner gamma BTC :", e)
+
+    # 2) Raw trades fallback.
+    try:
+        raw_rows = get_raw_trade_btc_markets_for_sniper()
+        for row in raw_rows:
+            add_market_row(row)
+    except Exception as e:
+        print("Erreur scanner raw BTC :", e)
+
+    print("BTC SCANNER SOURCE - marchés BTC récupérés :", len(markets))
+    return markets
 
 
 def calculate_btc_scanner_side_score(market_type, outcome, btc_live, threshold, price, minutes_left, context):
@@ -3926,7 +4073,7 @@ def run_btc_autonomous_scanner():
 
         minutes_left = minutes_until_btc_market_expiry(slug, title)
 
-        if minutes_left is None or minutes_left <= 0 or minutes_left > 1440:
+        if minutes_left is None or minutes_left <= 0 or minutes_left > 2880:
             rejected["bad_expiry"] += 1
             continue
 
@@ -4259,6 +4406,7 @@ def html_header(title):
             <a href="/resolution-sniper">Resolution Sniper</a>
             <a href="/sniper-debug">Sniper Debug</a>
             <a href="/btc-scanner">BTC Scanner</a>
+            <a href="/btc-market-source">BTC Market Source</a>
         </div>
     """
 
@@ -6137,6 +6285,80 @@ def sniper_debug_dashboard():
     html += html_footer()
     return html
 
+
+
+
+
+@app.get("/btc-market-source", response_class=HTMLResponse)
+def btc_market_source_dashboard():
+    init_db()
+    backfill_clean_fields()
+
+    rows = get_short_btc_markets_from_raw_and_gamma()
+    html = html_header("BTC Market Source")
+
+    html += """
+        <h1>🧪 BTC Market Source Debug</h1>
+        <div class="section">
+            <p>Cette page montre les marchés BTC récupérés avant scoring.</p>
+        </div>
+    """
+
+    html += f"""
+        <div class="grid">
+            {render_kpi("Marchés BTC récupérés", len(rows))}
+        </div>
+    """
+
+    html += """
+        <div class="section">
+            <h2>Marchés récupérés</h2>
+            <table>
+                <tr>
+                    <th>Market</th>
+                    <th>Outcome</th>
+                    <th>Prix</th>
+                    <th>Type</th>
+                    <th>Seuil</th>
+                    <th>Temps restant</th>
+                    <th>Slug</th>
+                </tr>
+    """
+
+    if not rows:
+        html += '<tr><td colspan="7">Aucun marché récupéré.</td></tr>'
+
+    for row in rows[:200]:
+        title = row.get("title")
+        slug = row.get("slug")
+        outcome = row.get("outcome")
+        price = float(row.get("price") or 0)
+        market_type = row.get("market_type") or classify_market(title)
+        threshold = extract_btc_threshold(title)
+        minutes_left = minutes_until_btc_market_expiry(slug, title)
+
+        threshold_display = "-" if not threshold else f"{threshold:.2f}"
+        minutes_display = "-" if minutes_left is None else f"{minutes_left:.1f} min"
+
+        html += f"""
+            <tr>
+                <td>{title}</td>
+                <td><b>{outcome}</b></td>
+                <td>{price:.3f}</td>
+                <td>{market_type}</td>
+                <td>{threshold_display}</td>
+                <td>{minutes_display}</td>
+                <td class="small">{slug}</td>
+            </tr>
+        """
+
+    html += """
+            </table>
+        </div>
+    """
+
+    html += html_footer()
+    return html
 
 
 
