@@ -294,44 +294,171 @@ def minutes_left(title):
     return round((dt - datetime.now(timezone.utc)).total_seconds() / 60, 2)
 
 
-def fetch_markets():
-    rows, seen = [], set()
-    queries = ["Bitcoin", "BTC", "price of Bitcoin", "Bitcoin above", "Bitcoin below", "Bitcoin less", "Bitcoin between", "Bitcoin dip", "Bitcoin reach"]
+def normalize_gamma_response(data):
+    if not data:
+        return []
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        return data.get("markets") or data.get("data") or data.get("results") or data.get("items") or []
+    return []
+
+
+def fetch_raw_markets(limit=300):
+    raw = []
+    seen = set()
+
+    queries = [
+        "",
+        "Bitcoin",
+        "BTC",
+        "price of Bitcoin",
+        "Will the price of Bitcoin",
+        "Bitcoin above",
+        "Bitcoin below",
+        "Bitcoin less",
+        "Bitcoin between",
+        "Bitcoin dip",
+        "Bitcoin reach",
+    ]
+
     for q in queries:
-        for offset in range(0, 2000, 100):
-            params_variants = [
-                {"closed":"false", "active":"true", "limit":100, "offset":offset, "q":q},
-                {"closed":"false", "active":"true", "limit":100, "offset":offset, "search":q},
-                {"limit":100, "offset":offset, "q":q},
-                {"limit":100, "offset":offset, "search":q},
+        for offset in range(0, 1500, 100):
+            variants = [
+                {"closed": "false", "active": "true", "limit": 100, "offset": offset},
+                {"closed": "false", "active": "true", "limit": 100, "offset": offset, "q": q},
+                {"closed": "false", "active": "true", "limit": 100, "offset": offset, "search": q},
+                {"closed": "false", "active": "true", "limit": 100, "offset": offset, "query": q},
+                {"limit": 100, "offset": offset, "q": q},
+                {"limit": 100, "offset": offset, "search": q},
             ]
-            for params in params_variants:
+
+            for params in variants:
+                if not q:
+                    params = {k: v for k, v in params.items() if k not in ["q", "search", "query"]}
+
                 data = get_json("https://gamma-api.polymarket.com/markets", params=params, timeout=20)
-                if not data:
-                    continue
-                markets = data.get("markets") or data.get("data") or data.get("results") if isinstance(data, dict) else data
+                markets = normalize_gamma_response(data)
+
                 if not markets:
                     continue
+
                 for m in markets:
                     title = m.get("question") or m.get("title") or m.get("name") or ""
                     slug = m.get("slug") or ""
-                    if not is_btc_market(title, slug):
+                    key = slug or title
+
+                    if not key or key in seen:
                         continue
-                    th = extract_threshold(title)
-                    mins = minutes_left(title)
-                    if not th or th < 40000 or th > 200000:
-                        continue
-                    if mins is None or mins <= 0 or mins > MAX_EXPIRY_MINUTES:
-                        continue
-                    for outcome, price in parse_outcomes_prices(m):
-                        key = (slug, outcome)
-                        if key in seen:
-                            continue
-                        seen.add(key)
-                        rows.append({"title": title, "slug": slug, "outcome": outcome, "price": price, "market_type": classify_market(title), "threshold": th, "minutes_left": mins})
-                if len(rows) >= 500:
-                    return rows
+
+                    seen.add(key)
+                    raw.append(m)
+
+                    if len(raw) >= limit:
+                        return raw
+
+    return raw
+
+
+def is_btc_market(title, slug):
+    text = f"{title} {slug}".lower()
+    if "bitcoin" not in text and "btc" not in text:
+        return False
+
+    blocked = ["before gta", "reserve", "unban", "$1m", "$1 m", "million", "150k", "2027", "2028"]
+    if any(b in text for b in blocked):
+        return False
+
+    allowed = [
+        "price of bitcoin",
+        "bitcoin be above",
+        "bitcoin be below",
+        "bitcoin be less",
+        "bitcoin be between",
+        "bitcoin above",
+        "bitcoin below",
+        "bitcoin less",
+        "bitcoin between",
+        "bitcoin dip",
+        "bitcoin reach",
+        "btc above",
+        "btc below",
+        "btc between",
+        "above-",
+        "below-",
+        "between-",
+        "less-than",
+    ]
+
+    return any(a in text for a in allowed)
+
+
+def fetch_markets():
+    rows, seen = [], set()
+    rejection = {
+        "raw_seen": 0,
+        "not_btc": 0,
+        "bad_threshold": 0,
+        "bad_expiry": 0,
+        "bad_outcomes": 0,
+        "accepted": 0,
+    }
+
+    raw_markets = fetch_raw_markets(limit=1200)
+
+    for m in raw_markets:
+        rejection["raw_seen"] += 1
+
+        title = m.get("question") or m.get("title") or m.get("name") or ""
+        slug = m.get("slug") or ""
+
+        if not is_btc_market(title, slug):
+            rejection["not_btc"] += 1
+            continue
+
+        th = extract_threshold(title + " " + slug)
+
+        if not th or th < 40000 or th > 200000:
+            rejection["bad_threshold"] += 1
+            continue
+
+        mins = minutes_left(title)
+
+        if mins is None:
+            mins = minutes_left(slug.replace("-", " "))
+
+        if mins is None or mins <= 0 or mins > MAX_EXPIRY_MINUTES:
+            rejection["bad_expiry"] += 1
+            continue
+
+        outcomes_prices = parse_outcomes_prices(m)
+
+        if not outcomes_prices:
+            rejection["bad_outcomes"] += 1
+            continue
+
+        for outcome, price in outcomes_prices:
+            key = (slug, outcome)
+            if key in seen:
+                continue
+
+            seen.add(key)
+
+            rows.append({
+                "title": title,
+                "slug": slug,
+                "outcome": outcome,
+                "price": price,
+                "market_type": classify_market(title + " " + slug),
+                "threshold": th,
+                "minutes_left": mins
+            })
+
+    rejection["accepted"] = len(rows)
+    STATE["source_rejection"] = rejection
+    STATE["raw_market_sample"] = raw_markets[:200]
     return rows
+
 
 
 def distance_and_favorable(market_type, outcome, btc, threshold):
@@ -520,6 +647,69 @@ def run_scan(open_new=True):
     STATE["last_scan"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S"); STATE["last_result"] = result; STATE["last_error"] = "-"
     return result
 
+@app.get("/source-debug", response_class=HTMLResponse)
+def source_debug():
+    init_db()
+    accepted = fetch_markets()
+    raw = STATE.get("raw_market_sample", [])
+    rejection = STATE.get("source_rejection", {})
+
+    html = header("Source Debug")
+    html += "<h1>🧪 Source Debug</h1>"
+
+    html += "<div class='grid'>"
+    html += kpi("Raw seen", rejection.get("raw_seen", 0))
+    html += kpi("Accepted", len(accepted))
+    html += kpi("Not BTC", rejection.get("not_btc", 0))
+    html += kpi("Bad threshold", rejection.get("bad_threshold", 0))
+    html += kpi("Bad expiry", rejection.get("bad_expiry", 0))
+    html += kpi("Bad outcomes", rejection.get("bad_outcomes", 0))
+    html += "</div>"
+
+    html += "<div class='section'><h2>Accepted BTC Markets</h2>"
+    html += "<table><tr><th>Market</th><th>Outcome</th><th>Price</th><th>Type</th><th>Threshold</th><th>Time</th><th>Slug</th></tr>"
+
+    if not accepted:
+        html += "<tr><td colspan='7'>Aucun marché accepté.</td></tr>"
+
+    for r in accepted[:100]:
+        html += f"""
+        <tr>
+            <td>{r['title']}</td>
+            <td><b>{r['outcome']}</b></td>
+            <td>{r['price']:.3f}</td>
+            <td>{r['market_type']}</td>
+            <td>{r['threshold']:.0f}</td>
+            <td>{r['minutes_left']:.1f}</td>
+            <td class='small'>{r['slug']}</td>
+        </tr>
+        """
+
+    html += "</table></div>"
+
+    html += "<div class='section'><h2>Raw Gamma Sample</h2>"
+    html += "<table><tr><th>Title</th><th>Slug</th><th>Active</th><th>Closed</th><th>EndDate</th><th>Outcomes</th><th>Prices</th></tr>"
+
+    for m in raw[:200]:
+        title = m.get("question") or m.get("title") or m.get("name") or ""
+        slug = m.get("slug") or ""
+        html += f"""
+        <tr>
+            <td>{title}</td>
+            <td class='small'>{slug}</td>
+            <td>{m.get('active')}</td>
+            <td>{m.get('closed')}</td>
+            <td>{m.get('endDate') or m.get('end_date') or m.get('endDateIso')}</td>
+            <td class='small'>{m.get('outcomes')}</td>
+            <td class='small'>{m.get('outcomePrices')}</td>
+        </tr>
+        """
+
+    html += "</table></div>"
+    html += footer()
+    return html
+
+
 
 def scanner_loop():
     init_db()
@@ -554,7 +744,7 @@ def num_cls(v):
 def header(title):
     return f"""<!doctype html><html><head><meta charset='utf-8'><title>{title}</title><meta http-equiv='refresh' content='60'><style>
     body{{font-family:Arial;margin:22px;background:#0f172a;color:#e5e7eb}}a{{color:#93c5fd;margin-right:14px;text-decoration:none}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;margin:18px 0}}.card,.section{{background:#111827;border:1px solid #1f2937;border-radius:10px;padding:14px;margin:14px 0}}.label{{color:#9ca3af;font-size:12px}}.value{{font-size:22px;font-weight:bold;margin-top:6px}}table{{width:100%;border-collapse:collapse;font-size:13px}}th,td{{border-bottom:1px solid #1f2937;padding:8px;vertical-align:top}}th{{background:#0b1220;color:#cbd5e1;text-align:left}}.small{{font-size:12px;color:#94a3b8}}.pos{{color:#22c55e}}.neg{{color:#ef4444}}.buy{{color:#22c55e;font-weight:bold}}.watch{{color:#f59e0b;font-weight:bold}}.skip{{color:#94a3b8}}
-    </style></head><body><div><a href='/'>Dashboard</a><a href='/candidates'>Candidates</a><a href='/trades'>Paper Trades</a><a href='/source'>Market Source</a></div>"""
+    </style></head><body><div><a href='/'>Dashboard</a><a href='/candidates'>Candidates</a><a href='/trades'>Paper Trades</a><a href='/source'>Market Source</a><a href='/source-debug'>Source Debug</a></div>"""
 
 
 def footer(): return "</body></html>"
